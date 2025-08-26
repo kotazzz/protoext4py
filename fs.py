@@ -7,7 +7,7 @@ class Packable:
     _fmt: str
 
     def pack(self) -> bytes:
-        return struct.pack(self._fmt, *attr.astuple(self, filter=lambda a, v: a.init))
+        return struct.pack(self._fmt, *(attr.astuple(self)))
 
     @classmethod
     def unpack(cls, data: bytes) -> "Packable":
@@ -15,14 +15,13 @@ class Packable:
 
 @attr.s(auto_attribs=True)
 class Extent(Packable):
-    _fmt: str = attr.ib(init=False, default="<QI")
+    _fmt = "<QI"
     start_block: int
     block_count: int
 
 @attr.s(auto_attribs=True)
 class Inode(Packable):
-    # Format: <HHIIQIIIHI (fields) + 4x(QI) (4 extents)
-    _fmt: str = attr.ib(init=False, default="<HHIIQIIIHI" + "QI"*4)
+    _fmt = "<HHIIQIIIHI" + "I" + "QI"*4
     mode: int
     uid: int
     size_lo: int
@@ -58,7 +57,7 @@ class Inode(Packable):
 
 @attr.s(auto_attribs=True)
 class GroupDesc(Packable):
-    _fmt: str = attr.ib(init=False, default="<QQQII")
+    _fmt = "<QQQII"
     block_bitmap_block: int
     inode_bitmap_block: int
     inode_table_block: int
@@ -67,7 +66,7 @@ class GroupDesc(Packable):
 
 @attr.s(auto_attribs=True)
 class Superblock(Packable):
-    _fmt: str = attr.ib(init=False, default="<QIIQQQQI")
+    _fmt = "<QIIQQQQI"
     fs_size_blocks: int
     block_size: int
     blocks_per_group: int
@@ -79,12 +78,19 @@ class Superblock(Packable):
     checksum: int = attr.ib(init=False, default=0)
     
     def calc_checksum(self, data: bytes) -> int:
-        return crc32(data + b"\x00"*4)
+        return crc32(data)
     
     def pack(self) -> bytes:
-        data = super().pack()
+        # Pack all fields except checksum
+        base_tuple = (
+            self.fs_size_blocks, self.block_size, self.blocks_per_group,
+            self.inodes_per_group, self.total_inodes, self.free_blocks_count,
+            self.free_inodes_count, self.first_data_block
+        )
+        data = struct.pack("<QIIQQQQI", *base_tuple)
+        
+        # Calculate and append checksum
         checksum = self.calc_checksum(data)
         self.checksum = checksum
-        packed_checksum = struct.pack("<I", checksum)
-        return data + packed_checksum
+        return data + struct.pack("<I", checksum)
     
