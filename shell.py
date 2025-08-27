@@ -117,27 +117,27 @@ def handle_lsd(args, cwd):
     else:
         path = cwd
     try:
+        # Pre-resolve parent inode for performance
+        parent_inode_num = fs._resolve_path(path)
+        parent_inode = fs._get_inode(parent_inode_num)
         entries = fs.readdir(path)
-        # Include all entries (including hidden ones starting with .)
         all_entries = sorted(entries)
-        
+
         # Print table header
         print("Inode  Mode       Links  Uid  Gid    Size Name")
         print("-" * 60)
-        
+
         for entry in all_entries:
-            entry_path = posixpath.join(path, entry).replace("\\", "/")
             try:
-                # First get the inode directly without following symlinks
-                parent_inode_num = fs._resolve_path(path)
-                parent_inode = fs._get_inode(parent_inode_num)
                 found_inode_num = fs._find_file_in_directory(parent_inode, entry)
                 if found_inode_num is None:
                     continue
-                
+
                 inode = fs._get_inode(found_inode_num)
-                
+
                 # For stat info, try to follow symlinks but handle broken ones
+                # Compute full path for stat
+                entry_path = posixpath.join(path, entry)
                 try:
                     stat_info = fs.stat(entry_path)
                     inode_num = found_inode_num
@@ -145,7 +145,7 @@ def handle_lsd(args, cwd):
                     # Broken symlink - use the symlink inode itself
                     stat_info = {"type": inode.mode & S_IFMT, "size": inode.size_lo}
                     inode_num = found_inode_num
-                
+
                 # File type and permissions
                 mode = inode.mode
                 # type_char = 'd' if stat_info["type"] & S_IFDIR else 'l' if stat_info["type"] & S_IFLNK else 'f' if stat_info["type"] & S_IFREG else 'c' if stat_info["type"] & S_IFCHR else 'b' if stat_info["type"] & S_IFBLK else 'p' if stat_info["type"] & S_IFIFO else 's' if stat_info["type"] & S_IFSOCK else '-'
@@ -163,7 +163,7 @@ def handle_lsd(args, cwd):
                 owner_perms = f"{'r' if mode & 0o400 else '-'}{'w' if mode & 0o200 else '-'}{'x' if mode & 0o100 else '-'}"
                 group_perms = f"{'r' if mode & 0o040 else '-'}{'w' if mode & 0o020 else '-'}{'x' if mode & 0o010 else '-'}"
                 other_perms = f"{'r' if mode & 0o004 else '-'}{'w' if mode & 0o002 else '-'}{'x' if mode & 0o001 else '-'}"
-                
+
                 # Human readable size
                 size = stat_info["size"]
                 if size < 1024:
@@ -174,18 +174,18 @@ def handle_lsd(args, cwd):
                     size_str = f"{size / (1024 * 1024):.1f}M"
                 else:
                     size_str = f"{size / (1024 * 1024 * 1024):.1f}G"
-                
+
                 # Format entry name with color
                 if stat_info["type"] & S_IFDIR:
                     entry_display = f"[bold blue]{entry}[/bold blue]"
                 else:
                     entry_display = entry
-                
+
                 print(f"{inode_num:5d} {type_char}{owner_perms}{group_perms}{other_perms} {inode.links_count:3d} {inode.uid:4d} {inode.gid:4d} {size_str:>7s} {entry_display}")
-                
+
             except Exception as e:
                 print(f"lsd: error reading {entry}: {e}")
-                
+
     except Exception as e:
         print(f"lsd: {e}")
 
@@ -268,19 +268,19 @@ def handle_cat(args, cwd):
             print("cat: Is not a regular file or symlink")
             return
         fd = fs.open(path, O_RDONLY)
-        
+
         # Read up to 2000 bytes
         read_size = min(2000, stat_info["size"])
         data = fs.read(fd, read_size)
         content = data.decode('utf-8', errors='ignore')
-        
+
         # Truncate if needed and add indication
         if stat_info["size"] > 2000:
             print(content)
             print(f"... [truncated, showing first 2000 bytes of {stat_info['size']} total]")
         else:
             print(content)
-        
+
         fs.close(fd)
     except Exception as e:
         print(f"cat: {e}")
@@ -312,12 +312,12 @@ def handle_cp(args, cwd):
         if src_stat["type"] == "directory":
             print("cp: directories not supported yet")
             return
-        
+
         # Read source file
         fd_src = fs.open(src_path, O_RDONLY)
         data = fs.read(fd_src, src_stat["size"])
         fs.close(fd_src)
-        
+
         # Write to destination
         fd_dst = fs.open(dst_path, O_CREAT | O_WRONLY | O_TRUNC)
         fs.write(fd_dst, data)
@@ -332,25 +332,34 @@ def handle_mv(args, cwd):
         print("mv: missing operand")
         return
     src_path = resolve_path(args[0], cwd)
-    dst_path = resolve_path(args[1], cwd)
+    dst_raw = resolve_path(args[1], cwd)
     try:
-        # For now, implement as copy + delete
+        # Determine actual destination path: if dst_raw is directory, move inside it
+        try:
+            dst_stat = fs.stat(dst_raw)
+            if dst_stat["type"] & S_IFDIR:
+                dst_path = posixpath.join(dst_raw, posixpath.basename(src_path))
+            else:
+                dst_path = dst_raw
+        except FileNotFoundError:
+            dst_path = dst_raw
+        # Copy + delete implementation
         # Check if source exists
         src_stat = fs.stat(src_path)
         if src_stat["type"] == "directory":
             print("mv: directories not supported yet")
             return
-        
+
         # Read source file
         fd_src = fs.open(src_path, O_RDONLY)
         data = fs.read(fd_src, src_stat["size"])
         fs.close(fd_src)
-        
+
         # Write to destination
         fd_dst = fs.open(dst_path, O_CREAT | O_WRONLY | O_TRUNC)
         fs.write(fd_dst, data)
         fs.close(fd_dst)
-        
+
         # Remove source
         fs.unlink(src_path)
     except Exception as e:
@@ -362,32 +371,28 @@ def handle_echo(args, cwd):
     if not args:
         print()
         return
-    
+
     # Check for output redirection
     if '>' in args:
         redirect_idx = args.index('>')
         if redirect_idx == len(args) - 1:
             print("echo: missing filename for redirection")
             return
-        
+
         # Text before '>' and filename after '>'
         text_args = args[:redirect_idx]
         filename = args[redirect_idx + 1]
-        
+
         if len(args) > redirect_idx + 2:
             print("echo: too many arguments after redirection")
             return
-        
+
         # Write to file
         fs = get_filesystem()
         file_path = resolve_path(filename, cwd)
         try:
             text = ' '.join(text_args) + '\n'
-            # Remove existing file to ensure new inode
-            try:
-                fs.unlink(file_path)
-            except FileNotFoundError:
-                pass
+            # Truncate or create file without unlink
             fd = fs.open(file_path, O_CREAT | O_WRONLY | O_TRUNC)
             fs.write(fd, text.encode('utf-8'))
             fs.close(fd)
@@ -412,14 +417,14 @@ def handle_chmod(args, cwd):
         except ValueError:
             print("chmod: invalid mode")
             return
-        
+
         # Get current inode
         inode_num = fs._resolve_path(path)
         inode = fs._get_inode(inode_num)
-        
+
         # Update mode (preserve file type bits)
         inode.mode = (inode.mode & 0o170000) | (mode & 0o0777)
-        
+
         # Write back
         fs._write_inode(inode_num, inode)
     except Exception as e:
@@ -440,14 +445,14 @@ def handle_chown(args, cwd):
         except ValueError:
             print("chown: invalid owner")
             return
-        
+
         # Get current inode
         inode_num = fs._resolve_path(path)
         inode = fs._get_inode(inode_num)
-        
+
         # Update uid
         inode.uid = uid
-        
+
         # Write back
         fs._write_inode(inode_num, inode)
     except Exception as e:
@@ -461,13 +466,13 @@ def handle_df(args, cwd):
         total_blocks = sb.fs_size_blocks
         free_blocks = sb.free_blocks_count
         used_blocks = total_blocks - free_blocks
-        
+
         # Convert to MB (assuming 4KB blocks)
         block_size_mb = 4096 / (1024 * 1024)
         total_mb = total_blocks * block_size_mb
         used_mb = used_blocks * block_size_mb
         free_mb = free_blocks * block_size_mb
-        
+
         print("Filesystem     1M-blocks  Used Available Use% Mounted on")
         print("rootfs              {:.0f}  {:.0f}      {:.0f}  {:.0f}% /".format(
             total_mb, used_mb, free_mb, (used_blocks / total_blocks) * 100))
@@ -494,31 +499,36 @@ def handle_ln(args, cwd):
     if len(args) < 2:
         print("ln: missing operand")
         return
-    
+
     target_path = resolve_path(args[0], cwd)
     link_path = resolve_path(args[1], cwd)
-    
+
     try:
+        # Prevent hard link to directory
+        target_stat = fs.stat(target_path)
+        if target_stat["type"] & S_IFDIR:
+            print(f"ln: {target_path}: hard link not allowed for directory")
+            return
         # Get target inode
         target_inode_num = fs._resolve_path(target_path)
-        
+
         # Get parent directory of link
         link_parent = posixpath.dirname(link_path)
         link_name = posixpath.basename(link_path)
-        
+
         if link_parent == "":
             link_parent = "/"
-        
+
         parent_inode_num = fs._resolve_path(link_parent)
-        
+
         # Add directory entry
         fs._add_directory_entry(parent_inode_num, link_name, target_inode_num, 1)
-        
+
         # Increment link count
         target_inode = fs._get_inode(target_inode_num)
         target_inode.links_count += 1
         fs._write_inode(target_inode_num, target_inode)
-        
+
     except Exception as e:
         print(f"ln: {e}")
 
@@ -586,10 +596,10 @@ def handle_rndfile(args, cwd):
     if len(args) < 2:
         print("rndfile: missing operand (usage: rndfile filename size)")
         return
-    
+
     filename = args[0]
     size_str = args[1]
-    
+
     # Parse size string (e.g., "10M", "1K", "500B")
     try:
         if size_str.upper().endswith('B'):
@@ -610,13 +620,13 @@ def handle_rndfile(args, cwd):
     except ValueError:
         print("rndfile: invalid size format")
         return
-    
+
     if size <= 0:
         print("rndfile: size must be positive")
         return
-    
+
     file_path = resolve_path(filename, cwd)
-    
+
     try:
         # Remove existing file to ensure new inode
         try:
@@ -659,7 +669,7 @@ def handle_stat(args, cwd):
         stat_info = fs.stat(path)
         inode_num = fs._resolve_path(path)
         inode = fs._get_inode(inode_num)
-        
+
         type_names = {
             S_IFDIR: "directory",
             S_IFLNK: "symbolic link",
