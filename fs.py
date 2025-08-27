@@ -3,30 +3,23 @@ import attr
 
 from crc32 import crc32
 
-
-class Packable:
-    _fmt: str
-
-    def pack(self) -> bytes:
-        return struct.pack(self._fmt, *(attr.astuple(self)))
-
-    @classmethod
-    def unpack(cls, data: bytes) -> "Packable":
-        return cls(*struct.unpack(cls._fmt, data))
-
+INODE_SIZE = 92 
 
 @attr.s(auto_attribs=True)
-class Extent(Packable):
-    _fmt = "<QI"
+class Extent:
     start_block: int
     block_count: int
 
+    def pack(self) -> bytes:
+        return struct.pack("<QI", self.start_block, self.block_count)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "Extent":
+        return cls(*struct.unpack("<QI", data))
+
 
 @attr.s(auto_attribs=True)
-class Inode(Packable):
-    _fmt = (
-        "<" + "I" * 11 + "QI" * 4
-    )  # 11 32-bit fields + 4 extents (each QI = 64+32 bit)
+class Inode:
     mode: int
     uid: int
     size_lo: int
@@ -59,11 +52,11 @@ class Inode(Packable):
         ext_tuple = []
         for ext in self.extents:
             ext_tuple.extend([ext.start_block, ext.block_count])
-        return struct.pack(self._fmt, *(base_tuple + tuple(ext_tuple)))
+        return struct.pack("<IIIIIIIIIII QIQIQIQI", *(base_tuple + tuple(ext_tuple)))
 
     @classmethod
     def unpack(cls, data: bytes) -> "Inode":
-        unpacked = struct.unpack(cls._fmt, data)
+        unpacked = struct.unpack("<IIIIIIIIIII QIQIQIQI", data)
         base_fields = unpacked[:11]
         extents_raw = unpacked[11:]
         extents = [Extent(extents_raw[i], extents_raw[i + 1]) for i in range(0, 8, 2)]
@@ -71,18 +64,23 @@ class Inode(Packable):
 
 
 @attr.s(auto_attribs=True)
-class GroupDesc(Packable):
-    _fmt = "<QQQII"
+class GroupDesc:
     block_bitmap_block: int
     inode_bitmap_block: int
     inode_table_block: int
     free_blocks_count: int
     free_inodes_count: int
 
+    def pack(self) -> bytes:
+        return struct.pack("<QQQII", self.block_bitmap_block, self.inode_bitmap_block, self.inode_table_block, self.free_blocks_count, self.free_inodes_count)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "GroupDesc":
+        return cls(*struct.unpack("<QQQII", data))
+
 
 @attr.s(auto_attribs=True)
-class Superblock(Packable):
-    _fmt = "<QIIQQQQI"
+class Superblock:
     fs_size_blocks: int
     block_size: int
     blocks_per_group: int

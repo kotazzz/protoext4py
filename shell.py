@@ -1,6 +1,7 @@
-import os
+# import os
+import posixpath
 import sys
-from fsapi import init_filesystem, get_filesystem, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC
+from fsapi import init_filesystem, get_filesystem, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, S_IFMT, S_IFDIR, S_IFREG, S_IFLNK, S_IFIFO, S_IFCHR, S_IFBLK, S_IFSOCK, BLOCK_SIZE, Inode, Extent
 from rich import print
 import random
 import string
@@ -72,12 +73,10 @@ def main():
 def resolve_path(path, cwd):
     if not path:
         return cwd
-    if os.path.isabs(path):
-        path = os.path.normpath(path)
+    if posixpath.isabs(path):
+        path = posixpath.normpath(path)
     else:
-        path = os.path.normpath(os.path.join(cwd, path))
-    # Convert Windows backslashes to Unix slashes for filesystem compatibility
-    path = path.replace("\\", "/")
+        path = posixpath.normpath(posixpath.join(cwd, path))
     return path
 
 @command('pwd', 'Print current working directory')
@@ -95,10 +94,17 @@ def handle_ls(args, cwd):
         entries = fs.readdir(path)
         # for entry in sorted(entries):
         #     print(entry)
-        formatted = [
-            f"[bold blue]{entry}[/bold blue]" if fs.stat(os.path.join(path, entry))["type"] == "directory" else entry
-            for entry in sorted(entries)
-        ]
+        formatted = []
+        for entry in sorted(entries):
+            try:
+                st = fs.stat(posixpath.join(path, entry))
+                if st["type"] & S_IFDIR:
+                    formatted.append(f"[bold blue]{entry}[/bold blue]")
+                else:
+                    formatted.append(entry)
+            except FileNotFoundError:
+                formatted.append(entry)  # Показываем имя, даже если файл «сломанный»
+
         print(*formatted, sep=" ")
     except Exception as e:
         print(f"ls: {e}")
@@ -116,20 +122,43 @@ def handle_lsd(args, cwd):
         all_entries = sorted(entries)
         
         # Print table header
-        print("Mode       Links  Uid  Gid    Size Name")
-        print("-" * 50)
+        print("Inode  Mode       Links  Uid  Gid    Size Name")
+        print("-" * 60)
         
         for entry in all_entries:
-            entry_path = os.path.join(path, entry).replace("\\", "/")
+            entry_path = posixpath.join(path, entry).replace("\\", "/")
             try:
-                stat_info = fs.stat(entry_path)
-                inode_num = fs._resolve_path(entry_path)
-                inode = fs._get_inode(inode_num)
+                # First get the inode directly without following symlinks
+                parent_inode_num = fs._resolve_path(path)
+                parent_inode = fs._get_inode(parent_inode_num)
+                found_inode_num = fs._find_file_in_directory(parent_inode, entry)
+                if found_inode_num is None:
+                    continue
+                
+                inode = fs._get_inode(found_inode_num)
+                
+                # For stat info, try to follow symlinks but handle broken ones
+                try:
+                    stat_info = fs.stat(entry_path)
+                    inode_num = found_inode_num
+                except (FileNotFoundError, OSError):
+                    # Broken symlink - use the symlink inode itself
+                    stat_info = {"type": inode.mode & S_IFMT, "size": inode.size_lo}
+                    inode_num = found_inode_num
                 
                 # File type and permissions
                 mode = inode.mode
-                type_char = 'd' if stat_info["type"] == "directory" else '-'
-                
+                # type_char = 'd' if stat_info["type"] & S_IFDIR else 'l' if stat_info["type"] & S_IFLNK else 'f' if stat_info["type"] & S_IFREG else 'c' if stat_info["type"] & S_IFCHR else 'b' if stat_info["type"] & S_IFBLK else 'p' if stat_info["type"] & S_IFIFO else 's' if stat_info["type"] & S_IFSOCK else '-'
+                type_char = {
+                    S_IFDIR: 'd',
+                    S_IFLNK: 'l',
+                    S_IFREG: '-',
+                    S_IFCHR: 'c',
+                    S_IFBLK: 'b',
+                    S_IFIFO: 'p',
+                    S_IFSOCK: 's'
+                }.get(stat_info["type"], '?')
+
                 # Convert to proper rwx format
                 owner_perms = f"{'r' if mode & 0o400 else '-'}{'w' if mode & 0o200 else '-'}{'x' if mode & 0o100 else '-'}"
                 group_perms = f"{'r' if mode & 0o040 else '-'}{'w' if mode & 0o020 else '-'}{'x' if mode & 0o010 else '-'}"
@@ -147,12 +176,12 @@ def handle_lsd(args, cwd):
                     size_str = f"{size / (1024 * 1024 * 1024):.1f}G"
                 
                 # Format entry name with color
-                if stat_info["type"] == "directory":
+                if stat_info["type"] & S_IFDIR:
                     entry_display = f"[bold blue]{entry}[/bold blue]"
                 else:
                     entry_display = entry
                 
-                print(f"{type_char}{owner_perms}{group_perms}{other_perms} {inode.links_count:3d} {inode.uid:4d} {inode.gid:4d} {size_str:>7s} {entry_display}")
+                print(f"{inode_num:5d} {type_char}{owner_perms}{group_perms}{other_perms} {inode.links_count:3d} {inode.uid:4d} {inode.gid:4d} {size_str:>7s} {entry_display}")
                 
             except Exception as e:
                 print(f"lsd: error reading {entry}: {e}")
@@ -169,7 +198,7 @@ def handle_cd(args, cwd):
         new_path = resolve_path(args[0], cwd)
     try:
         stat_info = fs.stat(new_path)
-        if stat_info["type"] == "directory":
+        if stat_info["type"] & S_IFDIR:
             return new_path
         else:
             print("cd: Not a directory")
@@ -202,6 +231,18 @@ def handle_rmdir(args, cwd):
     except Exception as e:
         print(f"rmdir: {e}")
 
+@command('rmdirr', 'Remove a directory and its contents')
+def handle_rmdir_recursive(args, cwd):
+    fs = get_filesystem()
+    if not args:
+        print("rmdir_recursive: missing operand")
+        return
+    path = resolve_path(args[0], cwd)
+    try:
+        fs.rmdir_recursive(path)
+    except Exception as e:
+        print(f"rmdir_recursive: {e}")
+
 @command('rm', 'Remove a file')
 def handle_rm(args, cwd):
     fs = get_filesystem()
@@ -223,8 +264,8 @@ def handle_cat(args, cwd):
     path = resolve_path(args[0], cwd)
     try:
         stat_info = fs.stat(path)
-        if stat_info["type"] != "file":
-            print("cat: Is a directory")
+        if not (stat_info["type"] & (S_IFREG | S_IFLNK)):
+            print("cat: Is not a regular file or symlink")
             return
         fd = fs.open(path, O_RDONLY)
         
@@ -457,8 +498,8 @@ def handle_ln(args, cwd):
         target_inode_num = fs._resolve_path(target_path)
         
         # Get parent directory of link
-        link_parent = os.path.dirname(link_path)
-        link_name = os.path.basename(link_path)
+        link_parent = posixpath.dirname(link_path)
+        link_name = posixpath.basename(link_path)
         
         if link_parent == "":
             link_parent = "/"
@@ -476,66 +517,124 @@ def handle_ln(args, cwd):
     except Exception as e:
         print(f"ln: {e}")
 
-        @command('rndfile', 'Create a file with random ASCII characters')
-        def handle_rndfile(args, cwd):
-            fs = get_filesystem()
-            if len(args) < 2:
-                print("rndfile: missing operand (usage: rndfile filename size)")
+@command('lns', 'Create a symbolic link')
+def handle_lns(args, cwd):
+    fs = get_filesystem()
+    if len(args) < 2:
+        print("lns: missing operand")
+        return
+
+    target_path = resolve_path(args[0], cwd)
+    link_path = resolve_path(args[1], cwd)
+
+    try:
+        # Get parent directory of link
+        link_parent = posixpath.dirname(link_path)
+        link_name = posixpath.basename(link_path)
+
+        if link_parent == "":
+            link_parent = "/"
+
+        parent_inode_num = fs._resolve_path(link_parent)
+
+        # Allocate inode for symlink
+        inode_num = fs._allocate_inode()
+
+        # Allocate block for symlink target
+        block = fs._allocate_block()
+
+        # Create symlink inode
+        target_path_bytes = target_path.encode('utf-8')
+        size = len(target_path_bytes)
+        inode = Inode(
+            mode=S_IFLNK | 0o777,
+            uid=0,
+            size_lo=size,
+            gid=0,
+            links_count=1,
+            size_high=0,
+            atime=0,
+            ctime=0,
+            mtime=0,
+            flags=0,
+            extent_count=1,
+            extents=[Extent(block, 1)] + [Extent(0, 0)] * 3,
+        )
+
+        fs._write_inode(inode_num, inode)
+
+        # Write target path to the block
+        fs.image_file.seek(block * BLOCK_SIZE)
+        fs.image_file.write(target_path_bytes)
+        fs.image_file.write(b"\x00" * (BLOCK_SIZE - size))
+        fs.image_file.flush()
+
+        # Add to parent directory
+        fs._add_directory_entry(parent_inode_num, link_name, inode_num, 7)  # 7 for symlink
+
+    except Exception as e:
+        print(f"lns: {e}")
+
+@command('rndfile', 'Create a file with random ASCII characters')
+def handle_rndfile(args, cwd):
+    fs = get_filesystem()
+    if len(args) < 2:
+        print("rndfile: missing operand (usage: rndfile filename size)")
+        return
+    
+    filename = args[0]
+    size_str = args[1]
+    
+    # Parse size string (e.g., "10M", "1K", "500B")
+    try:
+        if size_str.upper().endswith('B'):
+            size = int(size_str[:-1])
+        elif size_str.upper().endswith('K'):
+            size = int(size_str[:-1]) * 1024
+        elif size_str.upper().endswith('M'):
+            size = int(size_str[:-1]) * 1024 * 1024
+            if size > 150 * 1024 * 1024:
+                print("rndfile: too large")
                 return
+        elif size_str.upper().endswith('G'):
+            print("rndfile: too large")
+            return
+            # size = int(size_str[:-1]) * 1024 * 1024 * 1024
+        else:
+            size = int(size_str)
+    except ValueError:
+        print("rndfile: invalid size format")
+        return
+    
+    if size <= 0:
+        print("rndfile: size must be positive")
+        return
+    
+    file_path = resolve_path(filename, cwd)
+    
+    try:
+        
+        # Create file
+        fd = fs.open(file_path, O_CREAT | O_WRONLY | O_TRUNC)
+        
+        # Write random ASCII characters in chunks to avoid memory issues
+        chunk_size = min(1024 * 1024, size)  # 1MB chunks or smaller
+        written = 0
+        
+        while written < size:
+            remaining = size - written
+            current_chunk = min(chunk_size, remaining)
             
-            filename = args[0]
-            size_str = args[1]
-            
-            # Parse size string (e.g., "10M", "1K", "500B")
-            try:
-                if size_str.upper().endswith('B'):
-                    size = int(size_str[:-1])
-                elif size_str.upper().endswith('K'):
-                    size = int(size_str[:-1]) * 1024
-                elif size_str.upper().endswith('M'):
-                    size = int(size_str[:-1]) * 1024 * 1024
-                    if size > 150:
-                        print("rndfile: too large")
-                        return
-                elif size_str.upper().endswith('G'):
-                    print("rndfile: too large")
-                    return
-                    # size = int(size_str[:-1]) * 1024 * 1024 * 1024
-                else:
-                    size = int(size_str)
-            except ValueError:
-                print("rndfile: invalid size format")
-                return
-            
-            if size <= 0:
-                print("rndfile: size must be positive")
-                return
-            
-            file_path = resolve_path(filename, cwd)
-            
-            try:
-                
-                # Create file
-                fd = fs.open(file_path, O_CREAT | O_WRONLY | O_TRUNC)
-                
-                # Write random ASCII characters in chunks to avoid memory issues
-                chunk_size = min(1024 * 1024, size)  # 1MB chunks or smaller
-                written = 0
-                
-                while written < size:
-                    remaining = size - written
-                    current_chunk = min(chunk_size, remaining)
-                    
-                    # Generate random ASCII printable characters
-                    random_chars = ''.join(random.choices(string.ascii_letters + string.digits + string.punctuation + ' ', k=current_chunk))
-                    fs.write(fd, random_chars.encode('utf-8'))
-                    written += current_chunk
-                
-                fs.close(fd)
-                print(f"Created {filename} with {size} bytes of random ASCII data")
-                
-            except Exception as e:
-                print(f"rndfile: {e}")
+            # Generate random ASCII printable characters
+            random_chars = ''.join(random.choices(string.ascii_letters + string.digits + string.punctuation + ' ', k=current_chunk))
+            fs.write(fd, random_chars.encode('utf-8'))
+            written += current_chunk
+        
+        fs.close(fd)
+        print(f"Created {filename} with {size} bytes of random ASCII data")
+        
+    except Exception as e:
+        print(f"rndfile: {e}")
 
 @command('stat', 'Display file or directory status')
 def handle_stat(args, cwd):
@@ -549,9 +648,18 @@ def handle_stat(args, cwd):
         inode_num = fs._resolve_path(path)
         inode = fs._get_inode(inode_num)
         
+        type_names = {
+            S_IFDIR: "directory",
+            S_IFLNK: "symbolic link",
+            S_IFREG: "regular file",
+            S_IFIFO: "fifo",
+            S_IFCHR: "character device",
+            S_IFBLK: "block device",
+            S_IFSOCK: "socket",
+        }
         print(f"  File: {path}")
         print(f"  Size: {stat_info['size']}\t\tBlocks: {(stat_info['size'] + 4095) // 4096}")
-        print(f"  Type: {stat_info['type']}")
+        print(f"  Type: {type_names.get(stat_info['type'], 'unknown')}")
         print(f"Inode: {inode_num}\t\tLinks: {inode.links_count}")
         print(f"Access: ({inode.mode & 0o777:04o})\t\tUid: {inode.uid}\t\tGid: {inode.gid}")
         print(f"Access: {inode.atime}")

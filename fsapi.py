@@ -1,23 +1,27 @@
 import os
+import posixpath
 import struct
 import time
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
-from fs import Extent, Superblock, GroupDesc, Inode
+from fs import INODE_SIZE, Extent, Superblock, GroupDesc, Inode
 
 # File system constants
 BLOCK_SIZE = 4096
-INODE_SIZE = (
-    96  # Updated to match actual Inode structure size (rounded up to multiple of 4)
-)
 BLOCKS_PER_GROUP = 8192
 INODES_PER_GROUP = 2048
 ROOT_INODE = 2
 
 # File types
-S_IFMT = 0o170000  # File type mask
-S_IFREG = 0o100000  # Regular file
-S_IFDIR = 0o040000  # Directory
+S_IFMT   = 0o170000  # битовая маска для типа файла
+
+S_IFSOCK = 0o140000  # сокет
+S_IFLNK  = 0o120000  # символьная ссылка
+S_IFREG  = 0o100000  # обычный файл
+S_IFBLK  = 0o060000  # блочное устройство
+S_IFDIR  = 0o040000  # каталог
+S_IFCHR  = 0o020000  # символьное устройство
+S_IFIFO  = 0o010000  # FIFO / канал
 
 # File flags
 O_RDONLY = 0o0  # Read only
@@ -74,8 +78,8 @@ class DirEntry:
         )
 
         # Handle empty/end of directory entries
-        if inode_num == 0 or entry_len == 0:
-            return None, 0
+        if inode_num == 0:
+            return None, entry_len
 
         if len(data) < offset + 12:
             raise ValueError("Not enough data for directory entry header")
@@ -130,6 +134,25 @@ class FileSystem:
             if len(gd_data) == 32:
                 self.group_descriptors.append(GroupDesc.unpack(gd_data))
 
+        # Mark root directory block as used (in case old image)
+        try:
+            root_inode = self._get_inode(ROOT_INODE)
+            if root_inode.extents and root_inode.extents[0].block_count > 0:
+                root_dir_block = root_inode.extents[0].start_block
+                group_num = root_dir_block // BLOCKS_PER_GROUP
+                if group_num < len(self.group_descriptors):
+                    group_desc = self.group_descriptors[group_num]
+                    self.image_file.seek(group_desc.block_bitmap_block * BLOCK_SIZE)
+                    bitmap = bytearray(self.image_file.read(BLOCK_SIZE))
+                    block_idx = root_dir_block % BLOCKS_PER_GROUP
+                    byte_idx = block_idx // 8
+                    bit_idx = block_idx % 8
+                    bitmap[byte_idx] |= (1 << bit_idx)
+                    self.image_file.seek(group_desc.block_bitmap_block * BLOCK_SIZE)
+                    self.image_file.write(bitmap)
+        except Exception:
+            pass  # Ignore if fails
+
     def _get_inode(self, inode_num: int) -> Inode:
         """Get inode by number"""
         if inode_num == 0:
@@ -151,12 +174,10 @@ class FileSystem:
 
         self.image_file.seek(inode_offset)
         # Read only the actual size needed for Inode structure
-        import struct
 
-        actual_inode_size = struct.calcsize(Inode._fmt)
-        inode_data = self.image_file.read(actual_inode_size)
+        inode_data = self.image_file.read(INODE_SIZE)
 
-        if len(inode_data) != actual_inode_size:
+        if len(inode_data) != INODE_SIZE:
             raise ValueError(f"Could not read inode {inode_num}")
 
         return Inode.unpack(inode_data)
@@ -336,11 +357,15 @@ class FileSystem:
 
                 # Parse directory entries
                 offset = 0
-                while offset < len(block_data):
+            while offset + 14 <= len(block_data):
                     try:
                         result = DirEntry.unpack(block_data, offset)
                         if result[0] is None:  # Empty entry or end of directory
-                            break
+                            if result[1] == 0:
+                                break
+                            else:
+                                offset += result[1]
+                                continue
                         entry, entry_len = result
                         if entry.name == filename:
                             return entry.inode_num
@@ -384,8 +409,12 @@ class FileSystem:
                 while offset < len(block_data):
                     try:
                         result = DirEntry.unpack(block_data, offset)
-                        if result[0] is None:  # End of entries
-                            break
+                        if result[0] is None:  # Empty entry or end of directory
+                            if result[1] == 0:
+                                break
+                            else:
+                                offset += result[1]
+                                continue
                         entry, entry_len = result
                         if entry_len == 0:
                             break
@@ -496,7 +525,11 @@ class FileSystem:
                     try:
                         result = DirEntry.unpack(bytes(block_data[offset:]), 0)
                         if result[0] is None:  # Empty entry or end of directory
-                            break
+                            if result[1] == 0:
+                                break
+                            else:
+                                offset += result[1]
+                                continue
                         entry, entry_len = result
                         if entry.name == filename:
                             # Clear the entry by setting inode_num to 0
@@ -537,6 +570,33 @@ class FileSystem:
             if found_inode_num is None:
                 raise FileNotFoundError(f"No such file or directory: {component}")
 
+            # Check if it's a symlink
+            found_inode = self._get_inode(found_inode_num)
+            if found_inode.mode & S_IFLNK:
+                # Read the target path
+                target_data = b""
+                for extent in found_inode.extents:
+                    if extent.block_count == 0:
+                        break
+                    for block_offset in range(extent.block_count):
+                        block_num = extent.start_block + block_offset
+                        self.image_file.seek(block_num * BLOCK_SIZE)
+                        block_data = self.image_file.read(BLOCK_SIZE)
+                        null_pos = block_data.find(b"\x00")
+                        if null_pos != -1:
+                            target_data += block_data[:null_pos]
+                            break
+                        else:
+                            target_data += block_data
+                target_path = target_data.decode('utf-8').strip()
+                # Only resolve if target_path looks like a valid path
+                if target_path.startswith('/') or not any(c in target_path for c in ['\n', '\r']):
+                    # Resolve the target
+                    found_inode_num = self._resolve_path(target_path)
+                else:
+                    # This is not a symlink target but file content, treat as regular file
+                    pass
+
             current_inode_num = found_inode_num
 
         return current_inode_num
@@ -556,8 +616,8 @@ class FileSystem:
         except FileNotFoundError:
             if flags & O_CREAT:
                 # Create new file
-                parent_path = os.path.dirname(path)
-                filename = os.path.basename(path)
+                parent_path = posixpath.dirname(path)
+                filename = posixpath.basename(path)
 
                 if parent_path == "":
                     parent_path = "/"
@@ -629,17 +689,46 @@ class FileSystem:
 
         # Get current inode (in case it was updated)
         inode = self._get_inode(file_desc.inode_num)
-        file_size = inode.size_lo | (inode.size_high << 32)
 
-        # Use provided offset or file descriptor offset
-        read_offset = offset if offset is not None else file_desc.offset
+        # If it's a symlink, read the target path
+        if inode.mode & S_IFLNK:
+            target_data = b""
+            for extent in inode.extents:
+                if extent.block_count == 0:
+                    break
+                for block_offset in range(extent.block_count):
+                    block_num = extent.start_block + block_offset
+                    self.image_file.seek(block_num * BLOCK_SIZE)
+                    block_data = self.image_file.read(BLOCK_SIZE)
+                    null_pos = block_data.find(b"\x00")
+                    if null_pos != -1:
+                        target_data += block_data[:null_pos]
+                        break
+                    else:
+                        target_data += block_data
+            # Use provided offset or file descriptor offset
+            read_offset = offset if offset is not None else file_desc.offset
+            if read_offset >= len(target_data):
+                return b""
+            actual_size = min(size, len(target_data) - read_offset)
+            result = target_data[read_offset:read_offset + actual_size]
+            # Update offset if not using explicit offset
+            if offset is None:
+                file_desc.offset += len(result)
+            return result
+        else:
+            # Regular file
+            file_size = inode.size_lo | (inode.size_high << 32)
 
-        if read_offset >= file_size:
-            return b""
+            # Use provided offset or file descriptor offset
+            read_offset = offset if offset is not None else file_desc.offset
 
-        # Limit read size to file size
-        actual_size = min(size, file_size - read_offset)
-        result = bytearray()
+            if read_offset >= file_size:
+                return b""
+
+            # Limit read size to file size
+            actual_size = min(size, file_size - read_offset)
+            result = bytearray()
 
         bytes_read = 0
         current_offset = read_offset
@@ -809,8 +898,8 @@ class FileSystem:
     def unlink(self, path: str):
         """Delete file"""
         # Get parent directory and filename
-        parent_path = os.path.dirname(path)
-        filename = os.path.basename(path)
+        parent_path = posixpath.dirname(path)
+        filename = posixpath.basename(path)
 
         if parent_path == "":
             parent_path = "/"
@@ -834,15 +923,24 @@ class FileSystem:
 
         # Remove from directory
         self._remove_directory_entry(parent_inode_num, filename)
-        # Free blocks
-        self._free_inode_blocks(file_inode)
-        # Free inode
-        self._free_inode(file_inode_num)
+        
+        # Decrease links count
+        file_inode.links_count -= 1
+        
+        # Only free blocks and inode if no more links exist
+        if file_inode.links_count == 0:
+            # Free blocks
+            self._free_inode_blocks(file_inode)
+            # Free inode
+            self._free_inode(file_inode_num)
+        else:
+            # Just update the inode with decreased links count
+            self._write_inode(file_inode_num, file_inode)
 
     def mkdir(self, path: str, mode: int = 0o755):
         """Create directory"""
-        parent_path = os.path.dirname(path)
-        dirname = os.path.basename(path)
+        parent_path = posixpath.dirname(path)
+        dirname = posixpath.basename(path)
 
         if parent_path == "":
             parent_path = "/"
@@ -925,7 +1023,10 @@ class FileSystem:
                 offset = 0
                 while offset < len(block_data):
                     try:
-                        entry, entry_len = DirEntry.unpack(block_data, offset)
+                        result = DirEntry.unpack(block_data, offset)
+                        if result[0] is None:  # Empty entry or end of directory
+                            break
+                        entry, entry_len = result
                         if entry.name not in [".", ".."]:
                             entry_count += 1
                         offset += entry_len
@@ -939,8 +1040,8 @@ class FileSystem:
             raise OSError("Directory not empty")
 
         # Get parent directory
-        parent_path = os.path.dirname(path)
-        dirname = os.path.basename(path)
+        parent_path = posixpath.dirname(path)
+        dirname = posixpath.basename(path)
 
         if parent_path == "":
             parent_path = "/"
@@ -957,6 +1058,31 @@ class FileSystem:
         # Decrease parent links count
         parent_inode.links_count -= 1
         self._write_inode(parent_inode_num, parent_inode)
+
+    def rmdir_recursive(self, path: str):
+        """Remove a directory and its contents"""
+        dir_inode_num = self._resolve_path(path)
+        dir_inode = self._get_inode(dir_inode_num)
+
+        if not (dir_inode.mode & S_IFDIR):
+            raise OSError("Not a directory")
+
+        # Recursively remove all entries (skip . and .. entries)
+        for entry in self.readdir(path):
+            print(entry, path)
+            if entry in [".", ".."]:
+                continue
+            entry_path = posixpath.join(path, entry)
+            entry_inode = self._resolve_path(entry_path)
+            entry_stat = self._get_inode(entry_inode)
+
+            if entry_stat.mode & S_IFDIR:
+                self.rmdir_recursive(entry_path)
+            else:
+                self.unlink(entry_path)
+
+        # Finally, remove the directory itself
+        self.rmdir(path)
 
     def readdir(self, path: str) -> List[str]:
         """List directory contents"""
@@ -980,11 +1106,15 @@ class FileSystem:
 
                 # Parse directory entries
                 offset = 0
-                while offset < len(block_data):
+                while offset + 14 <= len(block_data):
                     try:
                         result = DirEntry.unpack(block_data, offset)
                         if result[0] is None:  # Empty entry or end of directory
-                            break
+                            if result[1] == 0:
+                                break
+                            else:
+                                offset += result[1]
+                                continue
                         entry, entry_len = result
                         if entry.name and entry.name not in [".", ".."]:
                             entries.append(entry.name)
@@ -1014,7 +1144,7 @@ class FileSystem:
             "ctime": inode.ctime,
             "mtime": inode.mtime,
             "links_count": inode.links_count,
-            "type": "directory" if (inode.mode & S_IFDIR) else "file",
+            "type": inode.mode & S_IFMT,
         }
 
     def close_filesystem(self):
