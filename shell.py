@@ -383,6 +383,11 @@ def handle_echo(args, cwd):
         file_path = resolve_path(filename, cwd)
         try:
             text = ' '.join(text_args) + '\n'
+            # Remove existing file to ensure new inode
+            try:
+                fs.unlink(file_path)
+            except FileNotFoundError:
+                pass
             fd = fs.open(file_path, O_CREAT | O_WRONLY | O_TRUNC)
             fs.write(fd, text.encode('utf-8'))
             fs.close(fd)
@@ -613,26 +618,33 @@ def handle_rndfile(args, cwd):
     file_path = resolve_path(filename, cwd)
     
     try:
-        
+        # Remove existing file to ensure new inode
+        try:
+            fs.unlink(file_path)
+        except FileNotFoundError:
+            pass
         # Create file
         fd = fs.open(file_path, O_CREAT | O_WRONLY | O_TRUNC)
-        
+
         # Write random ASCII characters in chunks to avoid memory issues
         chunk_size = min(1024 * 1024, size)  # 1MB chunks or smaller
         written = 0
-        
+
         while written < size:
             remaining = size - written
             current_chunk = min(chunk_size, remaining)
-            
+
             # Generate random ASCII printable characters
-            random_chars = ''.join(random.choices(string.ascii_letters + string.digits + string.punctuation + ' ', k=current_chunk))
+            random_chars = ''.join(random.choices(
+                string.ascii_letters + string.digits + string.punctuation + ' ',
+                k=current_chunk
+            ))
             fs.write(fd, random_chars.encode('utf-8'))
             written += current_chunk
-        
+
         fs.close(fd)
         print(f"Created {filename} with {size} bytes of random ASCII data")
-        
+
     except Exception as e:
         print(f"rndfile: {e}")
 

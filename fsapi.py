@@ -442,6 +442,11 @@ class FileSystem:
                 dir_inode.extents[extent_idx] = Extent(new_block, 1)
                 dir_inode.extent_count = max(dir_inode.extent_count, extent_idx + 1)
 
+                # Update directory inode size metadata
+                dir_size = sum(e.block_count for e in dir_inode.extents) * BLOCK_SIZE
+                dir_inode.size_lo = dir_size & 0xFFFFFFFF
+                dir_inode.size_high = dir_size >> 32
+
                 # Write new entry to the new block
                 self.image_file.seek(new_block * BLOCK_SIZE)
                 self.image_file.write(entry_data)
@@ -678,7 +683,16 @@ class FileSystem:
         if fd not in self.open_files:
             raise OSError("Bad file descriptor")
 
+        file_desc = self.open_files[fd]
         del self.open_files[fd]
+
+        # If inode has no links and no open descriptors, free its resources
+        inode_meta = self._get_inode(file_desc.inode_num)
+        if inode_meta.links_count == 0:
+            still_open = any(f.inode_num == file_desc.inode_num for f in self.open_files.values())
+            if not still_open:
+                self._free_inode_blocks(inode_meta)
+                self._free_inode(file_desc.inode_num)
 
     def read(self, fd: int, size: int, offset: Optional[int] = None) -> bytes:
         """Read data from file"""
@@ -791,36 +805,44 @@ class FileSystem:
 
         # Calculate new file size
         new_size = max(file_size, write_offset + len(data))
-        blocks_needed = (new_size + BLOCK_SIZE - 1) // BLOCK_SIZE
+        # Allocate blocks if needed, with robust logic for fragmentation
+        while True:
+            current_blocks = sum(e.block_count for e in inode.extents)
+            blocks_needed = (new_size + BLOCK_SIZE - 1) // BLOCK_SIZE
 
-        # Allocate blocks if needed
-        current_blocks = sum(extent.block_count for extent in inode.extents)
+            if current_blocks >= blocks_needed:
+                break  # All required blocks have been allocated
 
-        if blocks_needed > current_blocks:
-            # Simple allocation - just add to first available extent
             blocks_to_add = blocks_needed - current_blocks
 
+            # Find a free extent slot to start allocation
+            free_extent_found = False
             for extent_idx in range(len(inode.extents)):
                 if inode.extents[extent_idx].block_count == 0:
                     # Allocate new extent
                     start_block = self._allocate_block()
                     inode.extents[extent_idx] = Extent(start_block, 1)
                     inode.extent_count = max(inode.extent_count, extent_idx + 1)
-                    blocks_to_add -= 1
 
-                    # Allocate additional blocks for this extent
-                    for i in range(1, min(blocks_to_add + 1, blocks_needed)):
+                    # Try to greedily allocate contiguous blocks
+                    for i in range(1, blocks_to_add):
                         try:
                             next_block = self._allocate_block()
                             if next_block == start_block + i:
                                 inode.extents[extent_idx].block_count += 1
                             else:
-                                # Non-contiguous, need new extent
+                                # Block not contiguous. Free it and start a new extent.
+                                self._free_block(next_block)
                                 break
                         except OSError:
+                            # No more blocks available
                             break
 
-                    break
+                    free_extent_found = True
+                    break  # Recalculate in while loop
+
+            if not free_extent_found:
+                raise OSError("No free extent slots in inode")
 
         # Write data
         # Write data across extents with proper offset tracking
@@ -912,15 +934,16 @@ class FileSystem:
         
         # Decrease links count
         file_inode.links_count -= 1
-        
-        # Only free blocks and inode if no more links exist
-        if file_inode.links_count == 0:
-            # Free blocks
+
+        # Check if inode has no links and is not open by any descriptor
+        is_open = any(fd.inode_num == file_inode_num for fd in self.open_files.values())
+
+        if file_inode.links_count == 0 and not is_open:
+            # Free blocks and inode only when no links and no open descriptors
             self._free_inode_blocks(file_inode)
-            # Free inode
             self._free_inode(file_inode_num)
         else:
-            # Just update the inode with decreased links count
+            # Just update the inode metadata
             self._write_inode(file_inode_num, file_inode)
 
     def mkdir(self, path: str, mode: int = 0o755):
