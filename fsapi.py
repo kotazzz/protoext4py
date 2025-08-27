@@ -425,6 +425,95 @@ class FileSystem:
 
         raise OSError("Directory full")
 
+    def _free_inode_blocks(self, inode: Inode):
+        """Free all blocks allocated to an inode"""
+        for extent in inode.extents:
+            if extent.block_count == 0:
+                break
+            for block_offset in range(extent.block_count):
+                block_num = extent.start_block + block_offset
+                self._free_block(block_num)
+        # Reset extents
+        inode.extents = [Extent(0, 0) for _ in range(4)]
+        inode.extent_count = 0
+
+    def _free_inode(self, inode_num: int):
+        """Free an inode"""
+        if inode_num == 0:
+            raise ValueError("Invalid inode number 0")
+
+        # Calculate which group contains this inode
+        group_num = (inode_num - 1) // INODES_PER_GROUP
+        inode_index = (inode_num - 1) % INODES_PER_GROUP
+
+        if group_num >= len(self.group_descriptors):
+            raise ValueError(f"Inode {inode_num} is beyond filesystem bounds")
+
+        group_desc = self.group_descriptors[group_num]
+
+        # Read inode bitmap
+        self.image_file.seek(group_desc.inode_bitmap_block * BLOCK_SIZE)
+        bitmap = bytearray(self.image_file.read(BLOCK_SIZE))
+
+        # Clear inode bit
+        byte_idx = inode_index // 8
+        bit_idx = inode_index % 8
+        bitmap[byte_idx] &= ~(1 << bit_idx)
+
+        # Write bitmap back
+        self.image_file.seek(group_desc.inode_bitmap_block * BLOCK_SIZE)
+        self.image_file.write(bitmap)
+
+        # Update group descriptor
+        group_desc.free_inodes_count += 1
+        self.group_descriptors[group_num] = group_desc  # Update in-memory copy
+        self._write_group_descriptor(group_num, group_desc)
+
+        # Update superblock
+        self.superblock.free_inodes_count += 1
+        self._write_superblock()
+
+    def _remove_directory_entry(self, dir_inode_num: int, filename: str):
+        """Remove entry from directory"""
+        dir_inode = self._get_inode(dir_inode_num)
+
+        if not (dir_inode.mode & S_IFDIR):
+            raise OSError("Not a directory")
+
+        # Read directory blocks
+        for extent in dir_inode.extents:
+            if extent.block_count == 0:
+                break
+
+            for block_offset in range(extent.block_count):
+                block_num = extent.start_block + block_offset
+                self.image_file.seek(block_num * BLOCK_SIZE)
+                block_data = bytearray(self.image_file.read(BLOCK_SIZE))
+
+                # Parse directory entries
+                offset = 0
+                while offset < len(block_data):
+                    try:
+                        result = DirEntry.unpack(bytes(block_data[offset:]), 0)
+                        if result[0] is None:  # Empty entry or end of directory
+                            break
+                        entry, entry_len = result
+                        if entry.name == filename:
+                            # Clear the entry by setting inode_num to 0
+                            block_data[offset:offset + 4] = b'\x00\x00\x00\x00'
+                            self.image_file.seek(block_num * BLOCK_SIZE)
+                            self.image_file.write(block_data)
+                            self.image_file.flush()
+                            return
+                        offset += entry_len
+
+                        if entry_len == 0:  # Prevent infinite loop
+                            break
+                    except (ValueError, UnicodeDecodeError):
+                        break
+
+        raise FileNotFoundError(f"No such file or directory: {filename}")
+
     def _resolve_path(self, path: str) -> int:
         """Resolve path to inode number"""
         if path == "/":
@@ -508,7 +597,7 @@ class FileSystem:
         if flags & O_TRUNC:
             inode.size_lo = 0
             inode.size_high = 0
-            # TODO: Free allocated blocks
+            self._free_inode_blocks(inode)
             self._write_inode(inode_num, inode)
 
         # Create file descriptor
@@ -743,12 +832,12 @@ class FileSystem:
         if not (file_inode.mode & S_IFREG):
             raise OSError("Not a regular file")
 
-        # TODO: Remove from directory, free blocks, free inode
-        # For now, just mark as deleted by setting size to 0
-        file_inode.size_lo = 0
-        file_inode.size_high = 0
-        file_inode.links_count = 0
-        self._write_inode(file_inode_num, file_inode)
+        # Remove from directory
+        self._remove_directory_entry(parent_inode_num, filename)
+        # Free blocks
+        self._free_inode_blocks(file_inode)
+        # Free inode
+        self._free_inode(file_inode_num)
 
     def mkdir(self, path: str, mode: int = 0o755):
         """Create directory"""
@@ -849,10 +938,25 @@ class FileSystem:
         if entry_count > 0:
             raise OSError("Directory not empty")
 
-        # TODO: Free blocks, free inode, remove from parent
-        # For now, just mark as deleted
-        dir_inode.links_count = 0
-        self._write_inode(dir_inode_num, dir_inode)
+        # Get parent directory
+        parent_path = os.path.dirname(path)
+        dirname = os.path.basename(path)
+
+        if parent_path == "":
+            parent_path = "/"
+
+        parent_inode_num = self._resolve_path(parent_path)
+        parent_inode = self._get_inode(parent_inode_num)
+
+        # Remove from parent directory
+        self._remove_directory_entry(parent_inode_num, dirname)
+        # Free blocks
+        self._free_inode_blocks(dir_inode)
+        # Free inode
+        self._free_inode(dir_inode_num)
+        # Decrease parent links count
+        parent_inode.links_count -= 1
+        self._write_inode(parent_inode_num, parent_inode)
 
     def readdir(self, path: str) -> List[str]:
         """List directory contents"""
