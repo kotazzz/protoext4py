@@ -357,7 +357,7 @@ class FileSystem:
 
                 # Parse directory entries
                 offset = 0
-            while offset + 14 <= len(block_data):
+                while offset + 14 <= len(block_data):
                     try:
                         result = DirEntry.unpack(block_data, offset)
                         if result[0] is None:  # Empty entry or end of directory
@@ -547,8 +547,11 @@ class FileSystem:
 
         raise FileNotFoundError(f"No such file or directory: {filename}")
 
-    def _resolve_path(self, path: str) -> int:
-        """Resolve path to inode number"""
+    def _resolve_path(self, path: str, *, _depth: int = 0) -> int:
+        """Resolve path to inode number with symlink depth protection"""
+        MAX_SYMLINK_DEPTH = 16
+        if _depth > MAX_SYMLINK_DEPTH:
+            raise OSError("Too many levels of symbolic links")
         if path == "/":
             return ROOT_INODE
 
@@ -591,8 +594,8 @@ class FileSystem:
                 target_path = target_data.decode('utf-8').strip()
                 # Only resolve if target_path looks like a valid path
                 if target_path.startswith('/') or not any(c in target_path for c in ['\n', '\r']):
-                    # Resolve the target
-                    found_inode_num = self._resolve_path(target_path)
+                    # Resolve the target with increased depth
+                    found_inode_num = self._resolve_path(target_path, _depth=_depth + 1)
                 else:
                     # This is not a symlink target but file content, treat as regular file
                     pass
@@ -730,51 +733,44 @@ class FileSystem:
             actual_size = min(size, file_size - read_offset)
             result = bytearray()
 
+        # Read from extents with proper cumulative offsets
         bytes_read = 0
-        current_offset = read_offset
-
-        # Read from extents
+        file_offset_tracker = 0  # cumulative file offset at start of each extent
         for extent in inode.extents:
             if extent.block_count == 0 or bytes_read >= actual_size:
                 break
-
-            extent_start_byte = len(result) if len(result) > 0 else 0
             extent_size_bytes = extent.block_count * BLOCK_SIZE
-
-            # Check if we need to read from this extent
-            if current_offset < extent_start_byte + extent_size_bytes:
-                # Calculate read position within extent
-                extent_offset = max(0, current_offset - extent_start_byte)
-                bytes_to_read = min(
-                    actual_size - bytes_read, extent_size_bytes - extent_offset
-                )
-
-                # Read blocks
-                start_block = extent.start_block + (extent_offset // BLOCK_SIZE)
-                block_offset = extent_offset % BLOCK_SIZE
-
-                while (
-                    bytes_to_read > 0
-                    and start_block < extent.start_block + extent.block_count
-                ):
-                    self.image_file.seek(start_block * BLOCK_SIZE + block_offset)
-                    chunk_size = min(bytes_to_read, BLOCK_SIZE - block_offset)
-                    chunk = self.image_file.read(chunk_size)
-
-                    result.extend(chunk)
-                    bytes_read += len(chunk)
-                    bytes_to_read -= len(chunk)
-
-                    start_block += 1
-                    block_offset = 0
-
-            current_offset = extent_start_byte + extent_size_bytes
-
-        # Update offset if not using explicit offset
+            extent_start = file_offset_tracker
+            extent_end = extent_start + extent_size_bytes
+            # Skip extents before read_offset
+            if read_offset >= extent_end:
+                file_offset_tracker = extent_end
+                continue
+            # Stop if beyond requested range
+            if read_offset + actual_size <= extent_start:
+                break
+            # Determine read window within this extent
+            read_start = max(read_offset, extent_start)
+            read_end = min(read_offset + actual_size, extent_end)
+            extent_offset = read_start - extent_start
+            bytes_to_read = read_end - read_start
+            # Read blocks within extent
+            block_index = extent.start_block + (extent_offset // BLOCK_SIZE)
+            block_offset = extent_offset % BLOCK_SIZE
+            while bytes_to_read > 0 and block_index < extent.start_block + extent.block_count:
+                self.image_file.seek(block_index * BLOCK_SIZE + block_offset)
+                chunk = self.image_file.read(min(bytes_to_read, BLOCK_SIZE - block_offset))
+                result.extend(chunk)
+                read_len = len(chunk)
+                bytes_read += read_len
+                bytes_to_read -= read_len
+                block_index += 1
+                block_offset = 0
+            file_offset_tracker = extent_end
+        # Update file descriptor offset
         if offset is None:
-            file_desc.offset += len(result)
-
-        return bytes(result[:actual_size])
+            file_desc.offset += bytes_read
+        return bytes(result)
 
     def write(self, fd: int, data: bytes, offset: Optional[int] = None) -> int:
         """Write data to file"""
@@ -827,72 +823,62 @@ class FileSystem:
                     break
 
         # Write data
+        # Write data across extents with proper offset tracking
         bytes_written = 0
-        current_offset = write_offset
-
+        file_offset_tracker = 0  # cumulative file offset at start of each extent
+        data_len = len(data)
         for extent in inode.extents:
-            if extent.block_count == 0 or bytes_written >= len(data):
+            if extent.block_count == 0 or bytes_written >= data_len:
                 break
-
             extent_size_bytes = extent.block_count * BLOCK_SIZE
-
-            if current_offset < extent_size_bytes:
-                extent_offset = current_offset
-                bytes_to_write = min(
-                    len(data) - bytes_written, extent_size_bytes - extent_offset
-                )
-
-                # Write to blocks
-                start_block = extent.start_block + (extent_offset // BLOCK_SIZE)
-                block_offset = extent_offset % BLOCK_SIZE
-
-                data_offset = bytes_written
-
-                while (
-                    bytes_to_write > 0
-                    and start_block < extent.start_block + extent.block_count
-                ):
-                    chunk_size = min(bytes_to_write, BLOCK_SIZE - block_offset)
-
-                    # Read existing block if partial write
-                    if block_offset > 0 or chunk_size < BLOCK_SIZE:
-                        self.image_file.seek(start_block * BLOCK_SIZE)
-                        block_data = bytearray(self.image_file.read(BLOCK_SIZE))
-                        if len(block_data) < BLOCK_SIZE:
-                            block_data.extend(b"\x00" * (BLOCK_SIZE - len(block_data)))
-                    else:
-                        block_data = bytearray(BLOCK_SIZE)
-
-                    # Update block with new data
-                    end_offset = min(block_offset + chunk_size, BLOCK_SIZE)
-                    chunk_data = data[
-                        data_offset : data_offset + (end_offset - block_offset)
-                    ]
-                    block_data[block_offset:end_offset] = chunk_data
-
-                    # Write block back
-                    self.image_file.seek(start_block * BLOCK_SIZE)
-                    self.image_file.write(block_data)
-
-                    bytes_written += len(chunk_data)
-                    bytes_to_write -= len(chunk_data)
-                    data_offset += len(chunk_data)
-
-                    start_block += 1
-                    block_offset = 0
-
-            current_offset = extent_size_bytes
-
-        # Update inode size
+            extent_start = file_offset_tracker
+            extent_end = extent_start + extent_size_bytes
+            # Skip extents before write_offset
+            if write_offset >= extent_end:
+                file_offset_tracker = extent_end
+                continue
+            # Stop if beyond data end
+            if write_offset + data_len <= extent_start:
+                break
+            # Determine write window within this extent
+            write_start = max(write_offset, extent_start)
+            write_end = min(write_offset + data_len, extent_end)
+            extent_offset = write_start - extent_start
+            bytes_to_write = write_end - write_start
+            # Calculate starting block and offset
+            block_index = extent.start_block + (extent_offset // BLOCK_SIZE)
+            block_offset = extent_offset % BLOCK_SIZE
+            data_offset = write_start - write_offset
+            while bytes_to_write > 0 and block_index < extent.start_block + extent.block_count:
+                chunk_size = min(bytes_to_write, BLOCK_SIZE - block_offset)
+                # Read existing block for partial updates
+                if block_offset > 0 or chunk_size < BLOCK_SIZE:
+                    self.image_file.seek(block_index * BLOCK_SIZE)
+                    block_data = bytearray(self.image_file.read(BLOCK_SIZE))
+                    if len(block_data) < BLOCK_SIZE:
+                        block_data.extend(b"\x00" * (BLOCK_SIZE - len(block_data)))
+                else:
+                    block_data = bytearray(BLOCK_SIZE)
+                # Write chunk to block_data
+                block_data[block_offset:block_offset + chunk_size] = data[data_offset:data_offset + chunk_size]
+                # Flush block
+                self.image_file.seek(block_index * BLOCK_SIZE)
+                self.image_file.write(block_data)
+                # Advance pointers
+                bytes_written += chunk_size
+                bytes_to_write -= chunk_size
+                data_offset += chunk_size
+                block_index += 1
+                block_offset = 0
+            file_offset_tracker = extent_end
+        # Update inode metadata
         inode.size_lo = new_size & 0xFFFFFFFF
         inode.size_high = new_size >> 32
         inode.mtime = int(time.time())
         self._write_inode(file_desc.inode_num, inode)
-
-        # Update offset if not using explicit offset
+        # Update descriptor offset
         if offset is None:
             file_desc.offset += bytes_written
-
         return bytes_written
 
     def unlink(self, path: str):
@@ -997,6 +983,10 @@ class FileSystem:
         self._add_directory_entry(
             parent_inode_num, dirname, dir_inode_num, 2
         )  # Directory type
+        # Increment parent's link count for new '..' entry
+        parent_inode = self._get_inode(parent_inode_num)
+        parent_inode.links_count += 1
+        self._write_inode(parent_inode_num, parent_inode)
 
     def rmdir(self, path: str):
         """Remove empty directory"""
