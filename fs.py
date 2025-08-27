@@ -94,3 +94,21 @@ class Superblock(Packable):
         self.checksum = checksum
         return data + struct.pack("<I", checksum)
     
+    @classmethod
+    def unpack(cls, data: bytes) -> "Superblock":
+        # Unpack the main fields (52 bytes for the 8 fields in _fmt)
+        main_data = data[:52]
+        unpacked = struct.unpack("<QIIQQQQI", main_data)
+        
+        # Extract checksum if present (last 4 bytes)
+        if len(data) >= 56:
+            checksum_data = data[52:56]
+            checksum = struct.unpack("<I", checksum_data)[0]
+        else:
+            checksum = 0
+            
+        # Create superblock instance
+        superblock = cls(*unpacked)
+        superblock.checksum = checksum
+        return superblock
+    

@@ -1,4 +1,4 @@
-fs.img
+*.img
 
 # Python-generated files
 __pycache__/
