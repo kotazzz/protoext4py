@@ -1,9 +1,10 @@
 import os
+import struct
 from fs import Extent, Superblock, GroupDesc, Inode
 
 # CONSTANTS
 BLOCK_SIZE = 4096
-INODE_SIZE = 128
+INODE_SIZE = 96  # Updated to match actual Inode structure size
 BLOCKS_PER_GROUP = 8192  # 32MB per group
 INODES_PER_GROUP = 2048
 
@@ -107,9 +108,9 @@ def create_block_groups(f, num_groups: int):
         # Initialize inode bitmap (all free, except root inode in group 0)
         f.seek(inode_bitmap_block * BLOCK_SIZE)
         if group_num == 0:
-            # Mark inode 2 (root) as used - bit 1 (0-indexed)
+            # Mark inode 2 (root) as used - bit 1 (0-indexed, since inode numbering starts from 1)
             bitmap = bytearray(BLOCK_SIZE)
-            bitmap[0] = 0x04  # Set bit 2 (root inode)
+            bitmap[0] = 0x02  # Set bit 1 (for inode #2)
             f.write(bitmap)
         else:
             f.write(b'\x00' * BLOCK_SIZE)
@@ -146,7 +147,7 @@ def create_root_inode(f):
     
     # Create root directory inode
     root_inode = Inode(
-        mode=0o40755,  # Directory with 755 permissions
+        mode=0o040755,  # Directory with 755 permissions (S_IFDIR | 0755)
         uid=0,         # Root user
         size_lo=BLOCK_SIZE,  # Size of directory block
         gid=0,         # Root group
@@ -170,11 +171,20 @@ def create_root_inode(f):
     f.seek(root_inode_offset)
     f.write(root_inode.pack())
     
-    # Initialize root directory block with empty directory entries
+    # Initialize root directory block with . and .. entries
     root_dir_block = root_inode.extents[0].start_block
     f.seek(root_dir_block * BLOCK_SIZE)
-    # Write empty directory block (in a real implementation, you'd write . and .. entries)
-    f.write(b'\x00' * BLOCK_SIZE)
+    
+    # Create . entry (points to itself - inode 2)
+    dot_entry = struct.pack('<III', 2, 16, 1) + b'\x02\x00' + b'.' + b'\x00' * 1  # 16 bytes total
+    
+    # Create .. entry (points to itself for root - inode 2) 
+    dotdot_entry = struct.pack('<III', 2, 16, 2) + b'\x02\x00' + b'..' + b'\x00' * 0  # 16 bytes total
+    
+    # Write directory entries
+    dir_data = dot_entry + dotdot_entry + b'\x00' * (BLOCK_SIZE - 32)  # Fill rest with zeros
+    f.write(dir_data)
+    f.flush()
     
     print(f"Root inode created at offset {root_inode_offset}")
     print(f"Root directory block: {root_dir_block}")

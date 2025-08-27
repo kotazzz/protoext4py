@@ -21,7 +21,7 @@ class Extent(Packable):
 
 @attr.s(auto_attribs=True)
 class Inode(Packable):
-    _fmt = "<HHIIQIIIHI" + "I" + "QI"*4
+    _fmt = "<" + "I"*11 + "QI"*4  # 11 32-bit fields + 4 extents (each QI = 64+32 bit)
     mode: int
     uid: int
     size_lo: int
