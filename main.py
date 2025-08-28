@@ -4,7 +4,7 @@ from fs import INODE_SIZE, Superblock, GroupDesc, Inode
 from fsapi import BLOCK_SIZE, BLOCKS_PER_GROUP, INODES_PER_GROUP
 
 
-def create_empty_image(image_path: str, size_mb: int = 100):
+def create_empty_image(image_path: str, size_mb: int = 8):
     """Create an empty image file"""
     size_bytes = size_mb * 1024 * 1024
     with open(image_path, "wb") as f:
