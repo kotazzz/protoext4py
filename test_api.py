@@ -202,17 +202,25 @@ class TestAdvancedFS(TestCase):
         
         self.assertEqual(read_data, large_data)
 
-    def test_fragmentation_limit(self):
-        """Проверяет, что ФС корректно падает при попытке создать 4-й экстент."""
-        fd = fsapi.openf("/frag.txt", fsapi.O_CREAT | fsapi.O_RDWR)
+    def test_file_growth_beyond_inode_extents(self):
+        """Проверяет, что файл может успешно вырасти до 4 и более экстентов."""
+        fd = fsapi.openf("/growth.txt", fsapi.O_CREAT | fsapi.O_RDWR)
         
-        # Создаем 3 экстента, записывая по 1 байту в разные блоки
-        fsapi.write(fd, b'1', offset=0)
-        fsapi.write(fd, b'2', offset=fsapi.BLOCK_SIZE * 2)
-        fsapi.write(fd, b'3', offset=fsapi.BLOCK_SIZE * 4)
+        # В цикле записываем по одному байту в разные блоки, чтобы создать много экстентов
+        for i in range(10):  # Создаем 10 экстентов
+            offset = i * fsapi.BLOCK_SIZE * 2
+            fsapi.write(fd, bytes([65 + i]), offset=offset)  # 'A' + i
         
-        # Четвертая запись в новый блок должна вызвать ошибку
-        self.assertRaises(OSError, fsapi.write, fd, b'4', offset=fsapi.BLOCK_SIZE * 6)
+        # Проверяем, что все записи прошли без ошибок
+        # Читаем весь файл
+        file_size = fsapi.stat("/growth.txt")["size"]
+        data = fsapi.read(fd, file_size)
+        
+        # Проверяем, что данные на месте
+        for i in range(10):
+            expected_byte = 65 + i
+            self.assertEqual(data[i * fsapi.BLOCK_SIZE * 2], expected_byte, f"Byte at extent {i} is incorrect")
+        
         fsapi.close(fd)
         
     def test_unlink_open_file(self):

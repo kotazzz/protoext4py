@@ -31,6 +31,10 @@ O_RDWR = 0o2  # Read/write
 O_CREAT = 0o100  # Create if not exists
 O_TRUNC = 0o1000  # Truncate to zero length
 
+# Extent tree constants
+MAX_LEAF_ENTRIES = (BLOCK_SIZE - 8) // 12  # Max entries in leaf nodes in blocks
+MAX_INDEX_ENTRIES = (BLOCK_SIZE - 8) // 12  # Max entries in index nodes in blocks
+
 
 @dataclass
 class FileDescriptor:
@@ -1370,35 +1374,43 @@ class FileSystem:
             # Пустой корень, инициализируем
             header = ExtentHeader(magic=0xF30A, entries_count=1, max_entries=3, depth=0)
             root_data = header.pack() + new_leaf.pack() + b'\x00' * (48 - len(header.pack()) - len(new_leaf.pack()))
+            inode.extent_root = bytes(root_data)
+            self._write_inode(inode_num, inode)
         else:
             # Пытаемся вставить в существующий узел
-            success = self._insert_into_node(root_data, new_leaf, inode_num)
-            if not success:
-                # Вместо вызова _split_root, который не реализован,
-                # выбрасываем исключение. Это и есть то, что ожидает тест.
-                raise OSError("Cannot add new extent: file is too fragmented (max 3 extents).")
+            success, new_index = self._insert_into_node(root_data, new_leaf, inode_num, -1)
+            if success:
+                # Вставка удалась, обновляем корень в иноде
+                inode.extent_root = bytes(root_data)
+                self._write_inode(inode_num, inode)
+            else:
+                if new_index is None:
+                    # Корень полон, разделяем его
+                    self._split_root(inode_num, new_leaf)
+                    # _split_root уже обновил inode.extent_root, ничего не делаем
+                else:
+                    # Для индексного корня, разделяем его
+                    self._split_root(inode_num, new_index)
+                    # _split_root уже обновил inode.extent_root, ничего не делаем
 
-        inode.extent_root = bytes(root_data)
-        self._write_inode(inode_num, inode)
-
-    def _insert_into_node(self, node_data: bytearray, new_leaf: ExtentLeaf, inode_num: int) -> bool:
-        """Вставка в узел, возвращает True если удалось, False если нужно разделение"""
+    def _insert_into_node(self, node_data: bytearray, new_entry: Union[ExtentLeaf, ExtentIndex], inode_num: int, block_num: int = -1) -> Tuple[bool, Optional[ExtentIndex]]:
+        """Вставка в узел, возвращает (success, new_index_if_split)"""
         header = ExtentHeader.unpack(node_data[:8])
 
         if header.depth == 0:  # Листовой узел
             if header.entries_count >= header.max_entries:
-                return False
+                return False, None  # Полон, нужно разделить
             entries_data = node_data[8:8 + header.entries_count * 12]
             # Находим место для вставки (сортировка по logical_block)
             insert_pos = 0
             for i in range(header.entries_count):
                 leaf_data = entries_data[i*12 : (i+1)*12]
                 leaf = ExtentLeaf.unpack(leaf_data)
-                if leaf.logical_block > new_leaf.logical_block:
+                if leaf.logical_block > new_entry.logical_block:
                     break
                 insert_pos = i + 1
             # Вставляем
-            new_entries = entries_data[:insert_pos*12] + new_leaf.pack() + entries_data[insert_pos*12 : header.entries_count*12]
+            new_entries = entries_data[:insert_pos*12] + new_entry.pack() + entries_data[insert_pos*12 : header.entries_count*12]
             # Заполняем до максимального размера нулями
             max_size = header.max_entries * 12
             if len(new_entries) < max_size:
@@ -1408,36 +1420,96 @@ class FileSystem:
             node_data[8:8 + max_size] = new_entries
             header.entries_count += 1
             node_data[:8] = header.pack()
-            return True
+            if block_num != -1:
+                self.image_file.seek(block_num * BLOCK_SIZE)
+                self.image_file.write(node_data)
+            return True, None
         else:
             # Индексный узел - рекурсивно спускаемся
             entries_data = node_data[8:]
             # Ищем подходящий дочерний узел
             next_child_block = 0
             for i in range(header.entries_count):
-                idx_data = entries_data[i*12 : (i+1)*12]
+                idx_data = entries_data[i*12:(i+1)*12]
                 idx = ExtentIndex.unpack(idx_data)
-                if new_leaf.logical_block >= idx.logical_block:
+                if new_entry.logical_block >= idx.logical_block:
                     next_child_block = idx.child_block
                 else:
                     break
             if next_child_block == 0:
-                return False  # Не нашли
+                return False, None  # Не нашли
 
             # Читаем дочерний узел
             self.image_file.seek(next_child_block * BLOCK_SIZE)
             child_data = bytearray(self.image_file.read(BLOCK_SIZE))
-            if self._insert_into_node(child_data, new_leaf, inode_num):
-                # Записываем обновленный дочерний узел
-                self.image_file.seek(next_child_block * BLOCK_SIZE)
-                self.image_file.write(child_data)
-                return True
+            success, new_index = self._insert_into_node(child_data, new_entry, inode_num, next_child_block)
+            if success:
+                # Рекурсивный вызов уже записал обновленный дочерний узел на диск
+                return True, None
             else:
-                # Нужно разделить дочерний узел
-                self._split_node(next_child_block, new_leaf, inode_num)
-                return True
+                if new_index is None:
+                    # Листовой узел полон, разделяем его
+                    new_index = self._split_leaf_node(next_child_block, bytes(child_data), new_entry)
+                # Теперь вставляем new_index в текущий индексный узел
+                if header.entries_count >= header.max_entries:
+                    # Текущий индексный узел тоже полон, нужно разделить его
+                    return False, new_index
+                # Вставляем new_index
+                insert_pos = 0
+                for i in range(header.entries_count):
+                    idx_data = entries_data[i*12:(i+1)*12]
+                    idx = ExtentIndex.unpack(idx_data)
+                    if idx.logical_block > new_index.logical_block:
+                        break
+                    insert_pos = i + 1
+                new_entries = entries_data[:insert_pos*12] + new_index.pack() + entries_data[insert_pos*12:header.entries_count*12]
+                max_size = header.max_entries * 12
+                if len(new_entries) < max_size:
+                    new_entries += b'\x00' * (max_size - len(new_entries))
+                node_data[8:8 + max_size] = new_entries
+                header.entries_count += 1
+                node_data[:8] = header.pack()
+                if block_num != -1:
+                    self.image_file.seek(block_num * BLOCK_SIZE)
+                    self.image_file.write(node_data)
+                return True, None
 
-    def _split_root(self, inode_num: int, new_leaf: ExtentLeaf):
+    def _find_path(self, inode_num: int, logical_block: int) -> List[Tuple[int, bytes]]:
+        """Find path to leaf node containing logical_block, return list of (block_num, node_data)"""
+        path = []
+        inode = self._get_inode(inode_num)
+        current_data = inode.extent_root
+        current_block = -1  # Special value for root in inode
+        
+        while True:
+            path.append((current_block, current_data))
+            if len(current_data) < 8:
+                break
+            header = ExtentHeader.unpack(current_data[:8])
+            if header.magic != 0xF30A:
+                break
+            if header.depth == 0:
+                break  # Leaf node
+            entries_data = current_data[8:]
+            next_child_block = 0
+            for i in range(header.entries_count):
+                if i * 12 + 12 > len(entries_data):
+                    break
+                idx_data = entries_data[i*12:(i+1)*12]
+                idx = ExtentIndex.unpack(idx_data)
+                if logical_block >= idx.logical_block:
+                    next_child_block = idx.child_block
+                else:
+                    break
+            if next_child_block == 0:
+                break
+            # Read child node
+            self.image_file.seek(next_child_block * BLOCK_SIZE)
+            current_data = self.image_file.read(BLOCK_SIZE)
+            current_block = next_child_block
+        return path
+
+    def _split_root(self, inode_num: int, new_entry: Union[ExtentLeaf, ExtentIndex]):
         """Разделение корневого узла"""
         inode = self._get_inode(inode_num)
 
@@ -1450,37 +1522,29 @@ class FileSystem:
         header = ExtentHeader.unpack(root_data[:8])
         entries_data = root_data[8:]
 
-        # Предполагаем, что корень листовой и полон (entries_count = max_entries)
-        # Разделяем записи на две половины
-        mid = header.entries_count // 2
-        left_entries = []
-        right_entries = []
-
+        # Собираем все экстенты: старые + новый
+        all_entries = []
         for i in range(header.entries_count):
             leaf_data = entries_data[i*12:(i+1)*12]
             leaf = ExtentLeaf.unpack(leaf_data)
-            if i < mid:
-                left_entries.append(leaf)
-            else:
-                right_entries.append(leaf)
+            all_entries.append(leaf)
+        all_entries.append(new_entry)
+        all_entries.sort(key=lambda x: x.logical_block)
 
-        # Вставляем new_leaf в правильную половину
-        if new_leaf.logical_block < right_entries[0].logical_block:
-            left_entries.append(new_leaf)
-            left_entries.sort(key=lambda x: x.logical_block)
-        else:
-            right_entries.append(new_leaf)
-            right_entries.sort(key=lambda x: x.logical_block)
+        # Разделяем на две половины
+        mid = len(all_entries) // 2
+        left_entries = all_entries[:mid]
+        right_entries = all_entries[mid:]
 
         # Создаем левый листовой узел
-        left_header = ExtentHeader(magic=0xF30A, entries_count=len(left_entries), max_entries=3, depth=0)
+        left_header = ExtentHeader(magic=0xF30A, entries_count=len(left_entries), max_entries=MAX_LEAF_ENTRIES, depth=0)
         left_data = left_header.pack()
         for leaf in left_entries:
             left_data += leaf.pack()
         left_data += b'\x00' * (BLOCK_SIZE - len(left_data))
 
         # Создаем правый листовой узел
-        right_header = ExtentHeader(magic=0xF30A, entries_count=len(right_entries), max_entries=3, depth=0)
+        right_header = ExtentHeader(magic=0xF30A, entries_count=len(right_entries), max_entries=MAX_LEAF_ENTRIES, depth=0)
         right_data = right_header.pack()
         for leaf in right_entries:
             right_data += leaf.pack()
@@ -1501,26 +1565,98 @@ class FileSystem:
         inode.extent_root = root_data[:48]  # Ограничиваем 48 байтами
         self._write_inode(inode_num, inode)
 
-    def _split_node(self, node_block: int, new_leaf: ExtentLeaf, inode_num: int):
-        """Разделение обычного узла (упрощенная версия)"""
-        # Читаем узел
-        self.image_file.seek(node_block * BLOCK_SIZE)
-        # node_data = bytearray(self.image_file.read(BLOCK_SIZE))  # Пока не используется
+    def _split_leaf_node(self, node_block: int, node_data: bytes, new_leaf: ExtentLeaf) -> ExtentIndex:
+        """Разделение листового узла, возвращает новую индексную запись для родителя"""
+        # Собираем все старые экстенты + новый
+        header = ExtentHeader.unpack(node_data[:8])
+        entries_data = node_data[8:]
+        all_entries = []
+        for i in range(header.entries_count):
+            leaf_data = entries_data[i*12:(i+1)*12]
+            leaf = ExtentLeaf.unpack(leaf_data)
+            all_entries.append(leaf)
+        all_entries.append(new_leaf)
+        all_entries.sort(key=lambda x: x.logical_block)
+
+        # Разделяем на две половины
+        mid = len(all_entries) // 2
+        left_entries = all_entries[:mid]
+        right_entries = all_entries[mid:]
 
         # Выделяем новый блок для правой половины
         right_block = self._allocate_block()
 
-        # Создаем правый узел с новым экстентом
-        right_header = ExtentHeader(magic=0xF30A, entries_count=1, max_entries=3, depth=0)
-        right_data = right_header.pack() + new_leaf.pack() + b'\x00' * (48 - len(right_header.pack()) - len(new_leaf.pack()))
+        # Создаем левый узел (обновляем существующий)
+        left_header = ExtentHeader(magic=0xF30A, entries_count=len(left_entries), max_entries=MAX_LEAF_ENTRIES, depth=0)
+        left_data = left_header.pack()
+        for leaf in left_entries:
+            left_data += leaf.pack()
+        left_data += b'\x00' * (BLOCK_SIZE - len(left_data))
+
+        # Создаем правый узел
+        right_header = ExtentHeader(magic=0xF30A, entries_count=len(right_entries), max_entries=MAX_LEAF_ENTRIES, depth=0)
+        right_data = right_header.pack()
+        for leaf in right_entries:
+            right_data += leaf.pack()
+        right_data += b'\x00' * (BLOCK_SIZE - len(right_data))
+
+        # Записываем левый узел (обновляем существующий)
+        self.image_file.seek(node_block * BLOCK_SIZE)
+        self.image_file.write(left_data)
 
         # Записываем правый узел
         self.image_file.seek(right_block * BLOCK_SIZE)
         self.image_file.write(right_data)
 
-        # Обновляем родительский узел (упрощенная версия - добавляем указатель на правый узел)
-        # В реальности нужно найти родителя и вставить новый индекс
-        pass
+        # Возвращаем индексную запись для правого узла
+        return ExtentIndex(logical_block=right_entries[0].logical_block, child_block=right_block)
+
+    def _split_index_node(self, node_block: int, node_data: bytes, new_index: ExtentIndex) -> Tuple[ExtentIndex, bytes]:
+        """Разделение индексного узла, возвращает (поднятый индекс, данные нового правого узла)"""
+        header = ExtentHeader.unpack(node_data[:8])
+        entries_data = node_data[8:]
+        all_indices = []
+        for i in range(header.entries_count):
+            idx_data = entries_data[i*12:(i+1)*12]
+            idx = ExtentIndex.unpack(idx_data)
+            all_indices.append(idx)
+        all_indices.append(new_index)
+        all_indices.sort(key=lambda x: x.logical_block)
+
+        # Для индексных узлов, средний индекс поднимается наверх
+        mid = len(all_indices) // 2
+        left_indices = all_indices[:mid]
+        right_indices = all_indices[mid+1:]
+        promoted_index = all_indices[mid]
+
+        # Выделяем новый блок для правой половины
+        right_block = self._allocate_block()
+
+        # Создаем левый узел (обновляем существующий)
+        left_header = ExtentHeader(magic=0xF30A, entries_count=len(left_indices), max_entries=MAX_INDEX_ENTRIES, depth=header.depth)
+        left_data = left_header.pack()
+        for idx in left_indices:
+            left_data += idx.pack()
+        left_data += b'\x00' * (BLOCK_SIZE - len(left_data))
+
+        # Создаем правый узел
+        right_header = ExtentHeader(magic=0xF30A, entries_count=len(right_indices), max_entries=MAX_INDEX_ENTRIES, depth=header.depth)
+        right_data = right_header.pack()
+        for idx in right_indices:
+            right_data += idx.pack()
+        right_data += b'\x00' * (BLOCK_SIZE - len(right_data))
+
+        # Записываем левый узел
+        self.image_file.seek(node_block * BLOCK_SIZE)
+        self.image_file.write(left_data)
+
+        # Записываем правый узел
+        self.image_file.seek(right_block * BLOCK_SIZE)
+        self.image_file.write(right_data)
+
+        # Возвращаем поднятый индекс и данные правого узла
+        promoted_index.child_block = right_block  # Обновляем child_block на правый блок
+        return promoted_index, right_data
 
 
 # Global filesystem instance
