@@ -1,7 +1,8 @@
 # import os
 import posixpath
 import sys
-from fsapi import init_filesystem, get_filesystem, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, S_IFMT, S_IFDIR, S_IFREG, S_IFLNK, S_IFIFO, S_IFCHR, S_IFBLK, S_IFSOCK, BLOCK_SIZE, Inode, Extent
+from fs import Extent
+from fsapi import init_filesystem, get_filesystem, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, S_IFMT, S_IFDIR, S_IFREG, S_IFLNK, S_IFIFO, S_IFCHR, S_IFBLK, S_IFSOCK, BLOCK_SIZE, Inode
 from rich import print
 import random
 import string

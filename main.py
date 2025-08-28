@@ -1,11 +1,7 @@
 import os
 import struct
 from fs import INODE_SIZE, Superblock, GroupDesc, Inode
-
-# CONSTANTS
-BLOCK_SIZE = 4096
-BLOCKS_PER_GROUP = 8192  # 32MB per group
-INODES_PER_GROUP = 2048
+from fsapi import BLOCK_SIZE, BLOCKS_PER_GROUP, INODES_PER_GROUP
 
 
 def create_empty_image(image_path: str, size_mb: int = 100):

@@ -10,6 +10,23 @@ from rich.console import Console
 
 console = Console()
 
+class RaisesContext:
+    def __init__(self, exc_type):
+        self.exc_type = exc_type
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            raise AssertionError(f"Expected exception {self.exc_type.__name__}, but no exception was raised")
+
+        if not issubclass(exc_type, self.exc_type):
+            raise AssertionError(
+                f"Expected exception {self.exc_type.__name__}, but got {exc_type.__name__}"
+            )
+
+        return True  # подавляем исключение
 
 class TestCase:
     """Базовый класс для наших тестов с автоматической настройкой и очисткой."""
@@ -35,15 +52,23 @@ class TestCase:
         if not x:
             raise AssertionError(f"{msg} | Expression is not True")
 
-    def assertRaises(self, exc_type, func, *args, **kwargs):
-        try:
-            func(*args, **kwargs)
-        except exc_type:
-            return  # Ожидаемое исключение поймано
-        except Exception as e:
-            raise AssertionError(f"Expected exception {exc_type.__name__}, but got {e.__class__.__name__}")
-        raise AssertionError(f"Expected exception {exc_type.__name__}, but no exception was raised")
-
+    def assertRaises(self, exc_type, func=None, *args, **kwargs):
+        if func is None:
+            # Вариант через контекстный менеджер
+            return RaisesContext(exc_type)
+        else:
+            # Вариант вызова функции напрямую
+            try:
+                func(*args, **kwargs)
+            except exc_type:
+                return
+            except Exception as e:
+                raise AssertionError(
+                    f"Expected exception {exc_type.__name__}, but got {e.__class__.__name__}"
+                )
+            raise AssertionError(
+                f"Expected exception {exc_type.__name__}, but no exception was raised"
+            )
 
 class TestRunner:
     """Находит и запускает все тесты."""
@@ -278,6 +303,168 @@ class TestErrorConditions(TestCase):
         self.assertRaises(OSError, fsapi.unlink, "/dir_to_unlink")
 
 
+class TestNamingAndPaths(TestCase):
+    """Тесты на именование и пути."""
+
+    def test_filenames_with_special_chars(self):
+        filenames = [
+            "file with spaces.txt",
+            ".dotfile",
+            "file.with.many.dots",
+            "__underscores__"
+        ]
+        fsapi.mkdir("/special_names")
+        for name in filenames:
+            path = f"/special_names/{name}"
+            fd = fsapi.openf(path, fsapi.O_CREAT | fsapi.O_WRONLY)
+            fsapi.write(fd, name.encode())
+            fsapi.close(fd)
+        
+        contents = fsapi.readdir("/special_names")
+        self.assertEqual(sorted(contents), sorted(filenames))
+        
+        # Проверяем чтение
+        path = "/special_names/file with spaces.txt"
+        fd = fsapi.openf(path, fsapi.O_RDONLY)
+        data = fsapi.read(fd, 100)
+        fsapi.close(fd)
+        self.assertEqual(data.decode(), "file with spaces.txt")
+
+    def test_deeply_nested_directories(self):
+        path = ""
+        for i in range(10):
+            path += f"/dir{i}"
+            fsapi.mkdir(path)
+
+        file_path = path + "/final.txt"
+        fd = fsapi.openf(file_path, fsapi.O_CREAT | fsapi.O_WRONLY)
+        fsapi.write(fd, b"deep")
+        fsapi.close(fd)
+        
+        file_stat = fsapi.stat(file_path)
+        self.assertEqual(file_stat["size"], 4)
+
+
+class TestResourceManagement(TestCase):
+    """Тесты на управление ресурсами."""
+
+    def test_block_and_inode_recycling(self):
+        # 1. Запоминаем начальное состояние
+        sb_before = self.fs.superblock
+        initial_free_inodes = sb_before.free_inodes_count
+        initial_free_blocks = sb_before.free_blocks_count
+
+        # 2. Создаем файл, тратим 1 инод и 1 блок
+        fd = fsapi.openf("/temp.txt", fsapi.O_CREAT | fsapi.O_WRONLY)
+        fsapi.write(fd, b"a" * 10)
+        fsapi.close(fd)
+
+        sb_after_create = self.fs.superblock
+        self.assertEqual(sb_after_create.free_inodes_count, initial_free_inodes - 1)
+        self.assertEqual(sb_after_create.free_blocks_count, initial_free_blocks - 1)
+
+        # 3. Удаляем файл, ресурсы должны вернуться
+        fsapi.unlink("/temp.txt")
+        
+        sb_after_unlink = self.fs.superblock
+        self.assertEqual(sb_after_unlink.free_inodes_count, initial_free_inodes, "Inodes not freed after unlink")
+        self.assertEqual(sb_after_unlink.free_blocks_count, initial_free_blocks, "Blocks not freed after unlink")
+
+        # 4. Повторяем для каталога (тратит 1 инод и 1 блок)
+        fsapi.mkdir("/tempdir")
+        sb_after_mkdir = self.fs.superblock
+        self.assertEqual(sb_after_mkdir.free_inodes_count, initial_free_inodes - 1)
+        # Блок директории + обновление родительской директории (если это новый блок)
+        # Для простоты, допустим, что это всего 1 блок.
+        # В реальных ФС это сложнее, но для прототипа сойдет.
+        self.assertTrue(sb_after_mkdir.free_blocks_count < initial_free_blocks)
+        
+        fsapi.rmdir("/tempdir")
+        sb_after_rmdir = self.fs.superblock
+        self.assertEqual(sb_after_rmdir.free_inodes_count, initial_free_inodes, "Inodes not freed after rmdir")
+        # Проверка блоков может быть неточной, если rmdir меняет родителя,
+        # но она не должна сильно уменьшаться
+        self.assertTrue(initial_free_blocks - sb_after_rmdir.free_blocks_count <= 1)
+
+    def test_exhaust_inodes(self):
+        num_inodes_to_create = self.fs.superblock.free_inodes_count 
+        
+        with self.assertRaises(OSError):
+            for i in range(num_inodes_to_create + 5):
+                 # Создание пустого файла тратит один инод
+                 fd = fsapi.openf(f"/{i}.txt", fsapi.O_CREAT)
+                 fsapi.close(fd)
+
+
+class TestDataIntegrity(TestCase):
+    """Тесты на целостность данных и B+ дерева."""
+
+    def test_overwrite_file_boundary(self):
+        block_size = fsapi.BLOCK_SIZE
+        # Создаем файл размером чуть больше одного блока
+        initial_data = b'A' * (block_size + 10)
+        fd = fsapi.openf("/boundary.txt", fsapi.O_CREAT | fsapi.O_WRONLY)
+        fsapi.write(fd, initial_data)
+        
+        # Перезаписываем данные точно на границе блоков
+        overwrite_data = b'B' * 20
+        offset = block_size - 10
+        fsapi.write(fd, overwrite_data, offset=offset)
+        fsapi.close(fd)
+        
+        # Создаем ожидаемый результат
+        expected_data = bytearray(initial_data)
+        expected_data[offset : offset + len(overwrite_data)] = overwrite_data
+        
+        fd = fsapi.openf("/boundary.txt", fsapi.O_RDONLY)
+        read_data = fsapi.read(fd, len(expected_data) + 100)
+        fsapi.close(fd)
+        
+        self.assertEqual(read_data, bytes(expected_data))
+
+    def test_read_with_various_offsets_and_sizes(self):
+        # Создаем файл с дырой
+        fd = fsapi.openf("/hole.txt", fsapi.O_CREAT | fsapi.O_WRONLY)
+        fsapi.write(fd, b"begin", offset=0)
+        fsapi.write(fd, b"end", offset=100)
+        fsapi.close(fd)
+
+        expected_content = b"begin" + b'\x00' * 95 + b"end"
+        
+        fd = fsapi.openf("/hole.txt", fsapi.O_RDONLY)
+        # Читаем по одному байту
+        for i in range(len(expected_content)):
+            byte_read = fsapi.read(fd, 1, offset=i)
+            self.assertEqual(byte_read[0], expected_content[i], f"Byte at offset {i} is wrong")
+            
+        # Читаем кусок, пересекающий дыру
+        chunk = fsapi.read(fd, 10, offset=2)
+        self.assertEqual(chunk, expected_content[2:12])
+        fsapi.close(fd)
+
+    def test_multiple_open_descriptors_same_file(self):
+        path = "/multi_fd.txt"
+        fd1 = fsapi.openf(path, fsapi.O_CREAT | fsapi.O_RDWR)
+        fd2 = fsapi.openf(path, fsapi.O_RDWR)
+
+        # Пишем через fd1
+        fsapi.write(fd1, b"Hello from fd1")
+        
+        # Читаем через fd2 - должны увидеть изменения
+        content_fd2 = fsapi.read(fd2, 100, offset=0)
+        self.assertEqual(content_fd2, b"Hello from fd1")
+        
+        # Пишем через fd2
+        fsapi.write(fd2, b"fd2 says hi", offset=6)
+        
+        # Читаем через fd1
+        content_fd1 = fsapi.read(fd1, 100, offset=0)
+        self.assertEqual(content_fd1, b"Hello fd2 says hi")
+        
+        fsapi.close(fd1)
+        fsapi.close(fd2)
+
+
 if __name__ == "__main__":
     console.print("[bold white on blue]EXT4-like Filesystem Test Suite[/bold white on blue]\n")
     
@@ -285,5 +472,8 @@ if __name__ == "__main__":
     runner.run(TestCoreFS)
     runner.run(TestAdvancedFS)
     runner.run(TestErrorConditions)
+    runner.run(TestNamingAndPaths)
+    runner.run(TestResourceManagement)
+    runner.run(TestDataIntegrity)
     
     runner.summary()
