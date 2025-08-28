@@ -963,6 +963,10 @@ class FileSystem:
 
         group_desc = self.group_descriptors[group_num]
 
+        # Check if the group has any free blocks before proceeding
+        if group_desc.free_blocks_count == 0:
+            return None, inode
+
         self.image_file.seek(group_desc.block_bitmap_block * BLOCK_SIZE)
         bitmap = bytearray(self.image_file.read(BLOCK_SIZE))
 
