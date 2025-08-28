@@ -332,22 +332,22 @@ class FileSystem:
         # Clear block bit
         byte_idx = block_idx // 8
         bit_idx = block_idx % 8
-        # Only clear if set
+        # Only clear if set and update counters
         if bitmap[byte_idx] & (1 << bit_idx):
             bitmap[byte_idx] &= ~(1 << bit_idx)
 
-        # Write bitmap back
-        self.image_file.seek(group_desc.block_bitmap_block * BLOCK_SIZE)
-        self.image_file.write(bitmap)
+            # Write bitmap back
+            self.image_file.seek(group_desc.block_bitmap_block * BLOCK_SIZE)
+            self.image_file.write(bitmap)
 
-        # Update group descriptor
-        group_desc.free_blocks_count += 1
-        self.group_descriptors[group_num] = group_desc  # Update in-memory copy
-        self._write_group_descriptor(group_num, group_desc)
+            # Update group descriptor
+            group_desc.free_blocks_count += 1
+            self.group_descriptors[group_num] = group_desc  # Update in-memory copy
+            self._write_group_descriptor(group_num, group_desc)
 
-        # Update superblock
-        self.superblock.free_blocks_count += 1
-        self._write_superblock()
+            # Update superblock
+            self.superblock.free_blocks_count += 1
+            self._write_superblock()
 
     def _allocate_block_at(self, block_num: int):
         """Allocate a specific block by its number"""
@@ -503,7 +503,7 @@ class FileSystem:
             raise OSError("Not a directory")
 
         # Create new directory entry
-        new_entry = DirEntry(file_inode_num, len(filename), filename, file_type)
+        new_entry = DirEntry(file_inode_num, len(filename.encode('utf-8')), filename, file_type)
         entry_data = new_entry.pack()
 
         # Ищем место в существующих блоках директории
@@ -649,23 +649,26 @@ class FileSystem:
         self.image_file.seek(group_desc.inode_bitmap_block * BLOCK_SIZE)
         bitmap = bytearray(self.image_file.read(BLOCK_SIZE))
 
-        # Clear inode bit
         byte_idx = inode_index // 8
         bit_idx = inode_index % 8
-        bitmap[byte_idx] &= ~(1 << bit_idx)
 
-        # Write bitmap back
-        self.image_file.seek(group_desc.inode_bitmap_block * BLOCK_SIZE)
-        self.image_file.write(bitmap)
+        # Only free and update counts if the inode was actually in use
+        if bitmap[byte_idx] & (1 << bit_idx):
+            # Clear inode bit
+            bitmap[byte_idx] &= ~(1 << bit_idx)
 
-        # Update group descriptor
-        group_desc.free_inodes_count += 1
-        self.group_descriptors[group_num] = group_desc  # Update in-memory copy
-        self._write_group_descriptor(group_num, group_desc)
+            # Write bitmap back
+            self.image_file.seek(group_desc.inode_bitmap_block * BLOCK_SIZE)
+            self.image_file.write(bitmap)
 
-        # Update superblock
-        self.superblock.free_inodes_count += 1
-        self._write_superblock()
+            # Update group descriptor
+            group_desc.free_inodes_count += 1
+            self.group_descriptors[group_num] = group_desc  # Update in-memory copy
+            self._write_group_descriptor(group_num, group_desc)
+
+            # Update superblock
+            self.superblock.free_inodes_count += 1
+            self._write_superblock()
 
     def _remove_directory_entry(self, dir_inode_num: int, filename: str):
         """Remove entry from directory"""
@@ -812,7 +815,7 @@ class FileSystem:
 
     # Public API methods
 
-    def open(self, path: str, flags: int = O_RDONLY) -> int:
+    def open(self, path: str, flags: int = O_RDONLY, mode: int = 0o644) -> int:
         """Open file and return file descriptor"""
         try:
             inode_num = self._resolve_path(path)
@@ -842,7 +845,7 @@ class FileSystem:
                 header = ExtentHeader(magic=0xF30A, entries_count=0, max_entries=3, depth=0)
                 extent_root = header.pack() + b'\x00' * (48 - len(header.pack()))
                 inode = Inode(
-                    mode=S_IFREG | 0o644,
+                    mode=S_IFREG | mode,
                     uid=0,
                     size_lo=0,
                     gid=0,
@@ -1038,7 +1041,7 @@ class FileSystem:
             leaf = self._find_extent(inode, logical_block)
 
             if leaf is None:
-                # Если файл пустой (или после truncate), всегда выделяем новый блок и экстент
+                # Allocation Path: Allocate new block and extent
                 new_block = self._allocate_block()
                 new_leaf = ExtentLeaf(
                     logical_block=logical_block,
@@ -1051,17 +1054,23 @@ class FileSystem:
                 inode = self._get_inode(file_desc.inode_num)
                 leaf = self._find_extent(inode, logical_block)
                 if leaf is None:
-                    break  # что-то пошло не так
+                    # This should not happen after a successful insert
+                    raise OSError("Failed to find newly created extent")
 
-            # Вычисляем физический блок
-            block_offset_in_extent = logical_block - leaf.logical_block
-            if block_offset_in_extent >= leaf.block_count:
-                break
-            physical_block = leaf.get_start_block() + block_offset_in_extent
+                # Вычисляем физический блок
+                block_offset_in_extent = logical_block - leaf.logical_block
+                physical_block = leaf.get_start_block() + block_offset_in_extent
 
-            # Читаем существующий блок
-            self.image_file.seek(physical_block * BLOCK_SIZE)
-            block_data = bytearray(self.image_file.read(BLOCK_SIZE))
+                # Create empty block data (don't read garbage from disk)
+                block_data = bytearray(BLOCK_SIZE)
+            else:
+                # Overwrite Path: Read existing block data
+                block_offset_in_extent = logical_block - leaf.logical_block
+                physical_block = leaf.get_start_block() + block_offset_in_extent
+
+                # Читаем существующий блок
+                self.image_file.seek(physical_block * BLOCK_SIZE)
+                block_data = bytearray(self.image_file.read(BLOCK_SIZE))
 
             # Записываем данные в блок
             chunk_size = min(len(data) - data_offset, BLOCK_SIZE - block_offset)
@@ -1070,6 +1079,7 @@ class FileSystem:
             # Записываем блок обратно
             self.image_file.seek(physical_block * BLOCK_SIZE)
             self.image_file.write(block_data)
+            self.image_file.flush()
 
             bytes_written += chunk_size
             data_offset += chunk_size
@@ -1176,8 +1186,8 @@ class FileSystem:
         self._write_inode(dir_inode_num, dir_inode)
 
         # Create . and .. entries
-        dot_entry = DirEntry(dir_inode_num, 1, ".", 2)  # Directory type
-        dotdot_entry = DirEntry(parent_inode_num, 2, "..", 2)
+        dot_entry = DirEntry(dir_inode_num, len(".".encode('utf-8')), ".", 2)  # Directory type
+        dotdot_entry = DirEntry(parent_inode_num, len("..".encode('utf-8')), "..", 2)
 
         # Write directory entries
         self.image_file.seek(dir_block * BLOCK_SIZE)
@@ -1751,8 +1761,8 @@ def get_filesystem() -> FileSystem:
 
 
 # Convenience functions that mirror the API
-def openf(path: str, flags: int = O_RDONLY) -> int:
-    return get_filesystem().open(path, flags)
+def openf(path: str, flags: int = O_RDONLY, mode: int = 0o644) -> int:
+    return get_filesystem().open(path, flags, mode)
 
 
 def read(fd: int, size: int, offset: Optional[int] = None) -> bytes:
