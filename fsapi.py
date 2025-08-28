@@ -2,7 +2,7 @@ import os
 import posixpath
 import struct
 import time
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Tuple, Union
 from dataclasses import dataclass
 from fs import INODE_SIZE, Superblock, GroupDesc, Inode
 from fs import ExtentHeader, ExtentLeaf, ExtentIndex
@@ -160,12 +160,14 @@ class FileSystem:
         except Exception:
             pass  # Ignore if fails
 
-    def _get_inode(self, inode_num: int) -> Inode:
-        """Get inode by number"""
-        if inode_num == 0:
-            raise ValueError("Invalid inode number 0")
+    def _resolve_inode_location(self, inode_num: int) -> Tuple[int, int, GroupDesc, int]:
+        """
+        Calculates the group, index, group descriptor, and disk offset for a given inode number.
+        Returns: (group_num, inode_index, group_desc, inode_offset)
+        """
+        if inode_num <= 0:
+            raise ValueError(f"Invalid inode number {inode_num}")
 
-        # Calculate which group contains this inode
         group_num = (inode_num - 1) // INODES_PER_GROUP
         inode_index = (inode_num - 1) % INODES_PER_GROUP
 
@@ -174,14 +176,17 @@ class FileSystem:
 
         group_desc = self.group_descriptors[group_num]
 
-        # Calculate inode offset
         inode_offset = (
             group_desc.inode_table_block * BLOCK_SIZE + inode_index * INODE_SIZE
         )
+        
+        return group_num, inode_index, group_desc, inode_offset
+
+    def _get_inode(self, inode_num: int) -> Inode:
+        """Get inode by number"""
+        _, _, _, inode_offset = self._resolve_inode_location(inode_num)
 
         self.image_file.seek(inode_offset)
-        # Read only the actual size needed for Inode structure
-
         inode_data = self.image_file.read(INODE_SIZE)
 
         if len(inode_data) != INODE_SIZE:
@@ -191,22 +196,7 @@ class FileSystem:
 
     def _write_inode(self, inode_num: int, inode: Inode):
         """Write inode to disk"""
-        if inode_num == 0:
-            raise ValueError("Invalid inode number 0")
-
-        # Calculate which group contains this inode
-        group_num = (inode_num - 1) // INODES_PER_GROUP
-        inode_index = (inode_num - 1) % INODES_PER_GROUP
-
-        if group_num >= len(self.group_descriptors):
-            raise ValueError(f"Inode {inode_num} is beyond filesystem bounds")
-
-        group_desc = self.group_descriptors[group_num]
-
-        # Calculate inode offset
-        inode_offset = (
-            group_desc.inode_table_block * BLOCK_SIZE + inode_index * INODE_SIZE
-        )
+        _, _, _, inode_offset = self._resolve_inode_location(inode_num)
 
         self.image_file.seek(inode_offset)
         self.image_file.write(inode.pack())
@@ -223,6 +213,49 @@ class FileSystem:
         self.image_file.write(data)
         self.image_file.flush()
 
+    def _find_and_set_free_bit(self, bitmap: bytearray) -> Optional[int]:
+        """Finds the first free bit in a bitmap, sets it, and returns its index."""
+        for byte_idx in range(len(bitmap)):
+            if bitmap[byte_idx] != 0xFF:
+                for bit_idx in range(8):
+                    if not (bitmap[byte_idx] & (1 << bit_idx)):
+                        bitmap[byte_idx] |= 1 << bit_idx
+                        return byte_idx * 8 + bit_idx
+        return None
+
+    def _read_symlink_target(self, inode: Inode) -> bytes:
+        """Reads the target path from a symbolic link inode."""
+        if not ((inode.mode & S_IFMT) == S_IFLNK):
+            raise ValueError("Inode is not a symbolic link")
+
+        file_size = inode.size_lo | (inode.size_high << 32)
+        
+        # Check for inline symlink (common for short paths)
+        if self._find_extent(inode, 0) is None and file_size > 0:
+            # Data is stored directly in the extent_root area
+            return inode.extent_root[:file_size].rstrip(b'\x00')
+
+        # Read data from extents for longer paths
+        target_data = bytearray()
+        bytes_read = 0
+        while bytes_read < file_size:
+            logical_block = bytes_read // BLOCK_SIZE
+            leaf = self._find_extent(inode, logical_block)
+            if leaf is None:
+                break  # Should not happen in a valid symlink file
+            
+            block_offset_in_extent = logical_block - leaf.logical_block
+            physical_block = leaf.get_start_block() + block_offset_in_extent
+            
+            self.image_file.seek(physical_block * BLOCK_SIZE)
+            # Read only the remaining bytes needed
+            bytes_to_read = min(BLOCK_SIZE, file_size - bytes_read)
+            chunk = self.image_file.read(bytes_to_read)
+            target_data.extend(chunk)
+            bytes_read += len(chunk)
+
+        return bytes(target_data)
+
     def _allocate_inode(self) -> int:
         """Allocate a new inode"""
         for group_num, group_desc in enumerate(self.group_descriptors):
@@ -232,36 +265,22 @@ class FileSystem:
                 bitmap = bytearray(self.image_file.read(BLOCK_SIZE))
 
                 # Find free inode
-                for byte_idx in range(len(bitmap)):
-                    if bitmap[byte_idx] != 0xFF:  # Not all bits set
-                        for bit_idx in range(8):
-                            if not (bitmap[byte_idx] & (1 << bit_idx)):
-                                # Found free inode
-                                bitmap[byte_idx] |= 1 << bit_idx
+                bit_offset = self._find_and_set_free_bit(bitmap)
+                if bit_offset is not None:
+                    # Write bitmap back
+                    self.image_file.seek(group_desc.inode_bitmap_block * BLOCK_SIZE)
+                    self.image_file.write(bitmap)
 
-                                # Write bitmap back
-                                self.image_file.seek(
-                                    group_desc.inode_bitmap_block * BLOCK_SIZE
-                                )
-                                self.image_file.write(bitmap)
+                    # Update group descriptor
+                    group_desc.free_inodes_count -= 1
+                    self.group_descriptors[group_num] = group_desc  # Update in-memory copy
+                    self._write_group_descriptor(group_num, group_desc)
 
-                                # Update group descriptor
-                                group_desc.free_inodes_count -= 1
-                                self.group_descriptors[group_num] = (
-                                    group_desc  # Update in-memory copy
-                                )
-                                self._write_group_descriptor(group_num, group_desc)
+                    # Update superblock
+                    self.superblock.free_inodes_count -= 1
+                    self._write_superblock()
 
-                                # Update superblock
-                                self.superblock.free_inodes_count -= 1
-                                self._write_superblock()
-
-                                return (
-                                    group_num * INODES_PER_GROUP
-                                    + byte_idx * 8
-                                    + bit_idx
-                                    + 1
-                                )
+                    return group_num * INODES_PER_GROUP + bit_offset + 1
 
         raise OSError("No free inodes available")
 
@@ -274,44 +293,31 @@ class FileSystem:
                 bitmap = bytearray(self.image_file.read(BLOCK_SIZE))
 
                 # Find free block
-                for byte_idx in range(len(bitmap)):
-                    if bitmap[byte_idx] != 0xFF:  # Not all bits set
-                        for bit_idx in range(8):
-                            if not (bitmap[byte_idx] & (1 << bit_idx)):
-                                # Found free block
-                                bitmap[byte_idx] |= 1 << bit_idx
+                bit_offset = self._find_and_set_free_bit(bitmap)
+                if bit_offset is not None:
+                    # Calculate actual block number
+                    allocated_block = group_num * BLOCKS_PER_GROUP + bit_offset
 
-                                # Write bitmap back
-                                self.image_file.seek(
-                                    group_desc.block_bitmap_block * BLOCK_SIZE
-                                )
-                                self.image_file.write(bitmap)
+                    # For group 0, blocks 0-1 are reserved (superblock + group descriptors)
+                    # Make sure we don't allocate reserved blocks
+                    if group_num == 0 and allocated_block < 2:
+                        # Skip this block and continue searching
+                        continue
 
-                                # Update group descriptor
-                                group_desc.free_blocks_count -= 1
-                                self.group_descriptors[group_num] = (
-                                    group_desc  # Update in-memory copy
-                                )
-                                self._write_group_descriptor(group_num, group_desc)
+                    # Write bitmap back
+                    self.image_file.seek(group_desc.block_bitmap_block * BLOCK_SIZE)
+                    self.image_file.write(bitmap)
 
-                                # Update superblock
-                                self.superblock.free_blocks_count -= 1
-                                self._write_superblock()
+                    # Update group descriptor
+                    group_desc.free_blocks_count -= 1
+                    self.group_descriptors[group_num] = group_desc  # Update in-memory copy
+                    self._write_group_descriptor(group_num, group_desc)
 
-                                # Calculate actual block number, accounting for reserved blocks
-                                allocated_block = (
-                                    group_num * BLOCKS_PER_GROUP
-                                    + byte_idx * 8
-                                    + bit_idx
-                                )
+                    # Update superblock
+                    self.superblock.free_blocks_count -= 1
+                    self._write_superblock()
 
-                                # For group 0, blocks 0-1 are reserved (superblock + group descriptors)
-                                # Make sure we don't allocate reserved blocks
-                                if group_num == 0 and allocated_block < 2:
-                                    # Skip this block and continue searching
-                                    continue
-
-                                return allocated_block
+                    return allocated_block
 
         raise OSError("No free blocks available")
 
@@ -444,53 +450,9 @@ class FileSystem:
 
     def _find_file_in_directory(self, dir_inode: Inode, filename: str) -> Optional[int]:
         """Find file in directory, return inode number"""
-        if not ((dir_inode.mode & S_IFMT) == S_IFDIR):
-            return None
-
-        # Читаем блоки директории через B+ дерево экстентов
-        file_size = dir_inode.size_lo | (dir_inode.size_high << 32)
-        bytes_read = 0
-
-        while bytes_read < file_size:
-            # Находим экстент для текущего логического блока
-            logical_block = bytes_read // BLOCK_SIZE
-            leaf = self._find_extent(dir_inode, logical_block)
-            if leaf is None:
-                break
-
-            # Вычисляем физический блок
-            block_offset_in_extent = logical_block - leaf.logical_block
-            physical_block = leaf.get_start_block() + block_offset_in_extent
-
-            # Читаем блок
-            self.image_file.seek(physical_block * BLOCK_SIZE)
-            block_data = self.image_file.read(BLOCK_SIZE)
-
-            # Парсим записи директории
-            offset = 0
-            while offset + 14 <= len(block_data):
-                try:
-                    result = DirEntry.unpack(block_data, offset)
-                    if result[0] is None:  # Empty entry or end of directory
-                        if result[1] == 0:
-                            break
-                        else:
-                            offset += result[1]
-                            continue
-                    entry, entry_len = result
-                    if entry.name == filename:
-                        if entry.inode_num == 0:
-                            return None  # Skip deleted entries
-                        return entry.inode_num
-                    offset += entry_len
-
-                    if entry_len == 0:  # Prevent infinite loop
-                        break
-                except (ValueError, UnicodeDecodeError):
-                    break
-
-            bytes_read += BLOCK_SIZE
-
+        for entry, _, _ in self._traverse_directory(dir_inode):
+            if entry and entry.name == filename:
+                return entry.inode_num
         return None
 
     def _add_directory_entry(
@@ -633,17 +595,7 @@ class FileSystem:
 
     def _free_inode(self, inode_num: int):
         """Free an inode"""
-        if inode_num == 0:
-            raise ValueError("Invalid inode number 0")
-
-        # Calculate which group contains this inode
-        group_num = (inode_num - 1) // INODES_PER_GROUP
-        inode_index = (inode_num - 1) % INODES_PER_GROUP
-
-        if group_num >= len(self.group_descriptors):
-            raise ValueError(f"Inode {inode_num} is beyond filesystem bounds")
-
-        group_desc = self.group_descriptors[group_num]
+        group_num, inode_index, group_desc, _ = self._resolve_inode_location(inode_num)
 
         # Read inode bitmap
         self.image_file.seek(group_desc.inode_bitmap_block * BLOCK_SIZE)
@@ -774,32 +726,7 @@ class FileSystem:
             
             if (found_inode.mode & S_IFMT) == S_IFLNK and (follow_links or not is_last_component):
                 # Read the target path
-                target_data = b""
-                file_size = found_inode.size_lo | (found_inode.size_high << 32)
-                
-                # Check if it's an inline symlink (no valid extents in extent_root)
-                if self._find_extent(found_inode, 0) is None and file_size > 0:
-                    # Inline symlink: data is directly in extent_root
-                    target_data = found_inode.extent_root[:file_size].rstrip(b'\x00')
-                else:
-                    # Regular symlink: read data through extent tree
-                    bytes_read = 0
-                    while bytes_read < file_size:
-                        logical_block = bytes_read // BLOCK_SIZE
-                        leaf = self._find_extent(found_inode, logical_block)
-                        if leaf is None:
-                            break
-                        block_offset_in_extent = logical_block - leaf.logical_block
-                        physical_block = leaf.get_start_block() + block_offset_in_extent
-                        self.image_file.seek(physical_block * BLOCK_SIZE)
-                        block_data = self.image_file.read(BLOCK_SIZE)
-                        null_pos = block_data.find(b"\x00")
-                        if null_pos != -1:
-                            target_data += block_data[:null_pos]
-                            break
-                        else:
-                            target_data += block_data
-                        bytes_read += BLOCK_SIZE
+                target_data = self._read_symlink_target(found_inode)
                 target_path = target_data.decode('utf-8').strip()
                 # Only resolve if target_path looks like a valid path
                 if target_path.startswith('/') or not any(c in target_path for c in ['\n', '\r']):
@@ -915,32 +842,7 @@ class FileSystem:
 
         # If it's a symlink, read the target path
         if (inode.mode & S_IFMT) == S_IFLNK:
-            target_data = b""
-            file_size = inode.size_lo | (inode.size_high << 32)
-            
-            # Check if it's an inline symlink (no valid extents in extent_root)
-            if self._find_extent(inode, 0) is None and file_size > 0:
-                # Inline symlink: data is directly in extent_root
-                target_data = inode.extent_root[:file_size].rstrip(b'\x00')
-            else:
-                # Regular symlink: read data through extent tree
-                bytes_read = 0
-                while bytes_read < file_size:
-                    logical_block = bytes_read // BLOCK_SIZE
-                    leaf = self._find_extent(inode, logical_block)
-                    if leaf is None:
-                        break
-                    block_offset_in_extent = logical_block - leaf.logical_block
-                    physical_block = leaf.get_start_block() + block_offset_in_extent
-                    self.image_file.seek(physical_block * BLOCK_SIZE)
-                    block_data = self.image_file.read(BLOCK_SIZE)
-                    null_pos = block_data.find(b"\x00")
-                    if null_pos != -1:
-                        target_data += block_data[:null_pos]
-                        break
-                    else:
-                        target_data += block_data
-                    bytes_read += BLOCK_SIZE
+            target_data = self._read_symlink_target(inode)
             # Use provided offset or file descriptor offset
             read_offset = offset if offset is not None else file_desc.offset
             if read_offset >= len(target_data):
@@ -1221,38 +1123,9 @@ class FileSystem:
 
         # Check if directory is empty (only . and .. entries)
         entry_count = 0
-        file_size = dir_inode.size_lo | (dir_inode.size_high << 32)
-        bytes_read = 0
-
-        while bytes_read < file_size:
-            logical_block = bytes_read // BLOCK_SIZE
-            leaf = self._find_extent(dir_inode, logical_block)
-            if leaf is None:
-                break
-
-            block_offset_in_extent = logical_block - leaf.logical_block
-            physical_block = leaf.get_start_block() + block_offset_in_extent
-
-            self.image_file.seek(physical_block * BLOCK_SIZE)
-            block_data = self.image_file.read(BLOCK_SIZE)
-
-            offset = 0
-            while offset < len(block_data):
-                try:
-                    result = DirEntry.unpack(block_data, offset)
-                    if result[0] is None:  # Empty entry or end of directory
-                        break
-                    entry, entry_len = result
-                    if entry.name not in [".", ".."]:
-                        entry_count += 1
-                    offset += entry_len
-
-                    if entry_len == 0:
-                        break
-                except (ValueError, UnicodeDecodeError):
-                    break
-
-            bytes_read += BLOCK_SIZE
+        for entry, _, _ in self._traverse_directory(dir_inode):
+            if entry and entry.name not in [".", ".."]:
+                entry_count += 1
 
         if entry_count > 0:
             raise OSError("Directory not empty")
@@ -1311,46 +1184,9 @@ class FileSystem:
             raise OSError("Not a directory")
 
         entries = []
-
-        # Read directory blocks through extent tree
-        file_size = dir_inode.size_lo | (dir_inode.size_high << 32)
-        bytes_read = 0
-
-        while bytes_read < file_size:
-            logical_block = bytes_read // BLOCK_SIZE
-            leaf = self._find_extent(dir_inode, logical_block)
-            if leaf is None:
-                break
-
-            block_offset_in_extent = logical_block - leaf.logical_block
-            physical_block = leaf.get_start_block() + block_offset_in_extent
-
-            self.image_file.seek(physical_block * BLOCK_SIZE)
-            block_data = self.image_file.read(BLOCK_SIZE)
-
-            # Parse directory entries
-            offset = 0
-            while offset + 14 <= len(block_data):
-                try:
-                    result = DirEntry.unpack(block_data, offset)
-                    if result[0] is None:  # Empty entry or end of directory
-                        if result[1] == 0:
-                            break
-                        else:
-                            offset += result[1]
-                            continue
-                    entry, entry_len = result
-                    if entry.inode_num != 0 and entry.name and entry.name not in [".", ".."]:
-                        entries.append(entry.name)
-                    offset += entry_len
-
-                    if entry_len == 0:
-                        break
-                except (ValueError, UnicodeDecodeError):
-                    break
-
-            bytes_read += BLOCK_SIZE
-
+        for entry, _, _ in self._traverse_directory(dir_inode):
+            if entry and entry.inode_num != 0 and entry.name not in [".", ".."]:
+                entries.append(entry.name)
         return entries
 
     def stat(self, path: str) -> Dict[str, Union[int, str]]:
@@ -1398,6 +1234,49 @@ class FileSystem:
         if self.image_file:
             self.image_file.close()
             self.image_file = None
+
+    def _traverse_directory(self, dir_inode: Inode) -> Iterator[Tuple[Optional[DirEntry], int, int]]:
+        """
+        Generator to traverse all entries in a directory.
+        Yields tuples of (DirEntry or None, offset_in_block, physical_block_num).
+        'None' is yielded for empty/terminal entries.
+        """
+        if not ((dir_inode.mode & S_IFMT) == S_IFDIR):
+            return
+
+        file_size = dir_inode.size_lo | (dir_inode.size_high << 32)
+        bytes_scanned = 0
+
+        while bytes_scanned < file_size:
+            logical_block = bytes_scanned // BLOCK_SIZE
+            leaf = self._find_extent(dir_inode, logical_block)
+            
+            # Если для логического блока нет экстента, значит это "дыра" в файле директории,
+            # пропускаем ее.
+            if leaf is None:
+                bytes_scanned += BLOCK_SIZE
+                continue
+
+            block_offset_in_extent = logical_block - leaf.logical_block
+            physical_block = leaf.get_start_block() + block_offset_in_extent
+
+            self.image_file.seek(physical_block * BLOCK_SIZE)
+            block_data = self.image_file.read(BLOCK_SIZE)
+
+            offset = 0
+            while offset < len(block_data):
+                try:
+                    entry, entry_len = DirEntry.unpack(block_data, offset)
+                    
+                    yield entry, offset, physical_block
+                    
+                    if entry_len == 0:  # Prevent infinite loops on corrupted data
+                        break
+                    offset += entry_len
+                except (ValueError, IndexError):
+                    break  # Corrupted block or end of data
+            
+            bytes_scanned += BLOCK_SIZE
 
     def _find_extent(self, inode: Inode, logical_block: int) -> Optional[ExtentLeaf]:
         """Рекурсивный поиск экстента в B+ дереве."""

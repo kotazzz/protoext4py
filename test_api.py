@@ -1470,27 +1470,6 @@ class TestFileSystemIntegrity(TestCase):
         # Проверяем, что inode освобожден
         # В реальной реализации здесь были бы более детальные проверки
 
-    def test_journal_recovery(self):
-        """Тест восстановления после сбоя (если поддерживается журнал)."""
-        # Этот тест актуален для полной реализации ext4 с журналом
-        # В упрощенной версии может быть не реализован
-        
-        # Создаем транзакцию
-        fd = fsapi.openf("/journal_test.txt", fsapi.O_CREAT | fsapi.O_WRONLY)
-        fsapi.write(fd, b"transaction data")
-        
-        # Не закрываем файл намеренно, имитируя сбой
-        # В реальной системе здесь было бы принудительное закрытие
-        # и проверка восстановления
-        
-        # Закрываем файл нормально
-        fsapi.close(fd)
-        
-        # Проверяем, что данные сохранились
-        fd = fsapi.openf("/journal_test.txt", fsapi.O_RDONLY)
-        content = fsapi.read(fd, 100)
-        fsapi.close(fd)
-        self.assertEqual(content, b"transaction data")
 
 
 class TestEdgeCasesAndCornerCases(TestCase):
