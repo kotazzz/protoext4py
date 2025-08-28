@@ -13,7 +13,7 @@ def create_empty_image(image_path: str, size_mb: int = 100):
     size_bytes = size_mb * 1024 * 1024
     with open(image_path, "wb") as f:
         f.write(b"\x00" * size_bytes)
-    print(f"Created empty image {image_path} ({size_mb}MB)")
+    # print(f"Created empty image {image_path} ({size_mb}MB)")
 
 
 def mkfs(image_path: str):
@@ -26,12 +26,12 @@ def mkfs(image_path: str):
     num_groups = (block_count + BLOCKS_PER_GROUP - 1) // BLOCKS_PER_GROUP
     total_inodes = num_groups * INODES_PER_GROUP
 
-    print("Initializing filesystem:")
-    print(f"  Size: {size} bytes ({size // (1024 * 1024)}MB)")
-    print(f"  Block size: {BLOCK_SIZE}")
-    print(f"  Total blocks: {block_count}")
-    print(f"  Block groups: {num_groups}")
-    print(f"  Total inodes: {total_inodes}")
+    # print("Initializing filesystem:")
+    # print(f"  Size: {size} bytes ({size // (1024 * 1024)}MB)")
+    # print(f"  Block size: {BLOCK_SIZE}")
+    # print(f"  Total blocks: {block_count}")
+    # print(f"  Block groups: {num_groups}")
+    # print(f"  Total inodes: {total_inodes}")
 
     with open(image_path, "r+b") as f:
         # Step 1: Create and write superblock
@@ -43,7 +43,7 @@ def mkfs(image_path: str):
         # Step 3: Create root inode
         create_root_inode(f)
 
-        print("Filesystem initialized successfully!")
+        # print("Filesystem initialized successfully!")
 
 
 def create_superblock(f, block_count: int, num_groups: int, total_inodes: int):
@@ -78,7 +78,7 @@ def create_superblock(f, block_count: int, num_groups: int, total_inodes: int):
     superblock_data = superblock.pack()
     f.write(superblock_data)
 
-    print(f"Superblock written ({len(superblock_data)} bytes)")
+    # print(f"Superblock written ({len(superblock_data)} bytes)")
 
 
 def create_block_groups(f, num_groups: int, block_count: int):
@@ -151,14 +151,14 @@ def create_block_groups(f, num_groups: int, block_count: int):
         f.seek(inode_table_block * BLOCK_SIZE)
         f.write(b"\x00" * (inode_table_blocks * BLOCK_SIZE))
 
-        print(f"Group {group_num}: bitmap_block={block_bitmap_block}, inode_bitmap={inode_bitmap_block}, inode_table={inode_table_block}, blocks_in_group={blocks_in_group}, free_blocks={free_blocks_count}")
+        # print(f"Group {group_num}: bitmap_block={block_bitmap_block}, inode_bitmap={inode_bitmap_block}, inode_table={inode_table_block}, blocks_in_group={blocks_in_group}, free_blocks={free_blocks_count}")
 
     # Write group descriptors
     f.seek(BLOCK_SIZE)  # After superblock
     for group_desc in group_descriptors:
         f.write(group_desc.pack())
 
-    print(f"Created {num_groups} block groups")
+    # print(f"Created {num_groups} block groups")
 
 
 def create_root_inode(f):
@@ -258,8 +258,8 @@ def create_root_inode(f):
     f.seek(0)
     f.write(superblock.pack())
 
-    print(f"Root inode created at offset {root_inode_offset}")
-    print(f"Root directory block: {root_dir_block}")
+    # print(f"Root inode created at offset {root_inode_offset}")
+    # print(f"Root directory block: {root_dir_block}")
 
 
 def main():
