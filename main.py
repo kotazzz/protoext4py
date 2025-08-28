@@ -111,7 +111,7 @@ def create_block_groups(f, num_groups: int, block_count: int):
             inode_bitmap_block=inode_bitmap_block,
             inode_table_block=inode_table_block,
             free_blocks_count=free_blocks_count,
-            free_inodes_count=INODES_PER_GROUP - (1 if group_num == 0 else 0),
+            free_inodes_count=INODES_PER_GROUP - (2 if group_num == 0 else 0),
         )
         group_descriptors.append(group_desc)
 
@@ -138,7 +138,7 @@ def create_block_groups(f, num_groups: int, block_count: int):
         f.seek(inode_bitmap_block * BLOCK_SIZE)
         if group_num == 0:
             bitmap = bytearray(BLOCK_SIZE)
-            bitmap[0] = 0x02  # inode 2
+            bitmap[0] = 0x03  # inode 1 and 2
             f.write(bitmap)
         else:
             f.write(b"\x00" * BLOCK_SIZE)

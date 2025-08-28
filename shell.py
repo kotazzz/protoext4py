@@ -1,8 +1,8 @@
-# import os
+# imfrom fsapi import init_filesystem, get_filesystem, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, S_IFDIR, S_IFREG, S_IFLNK, S_IFIFO, S_IFCHR, S_IFBLK, S_IFSOCK, BLOCK_SIZE, Inode, ExtentHeader, ExtentLeafort os
 import posixpath
 import sys
-from fs import Extent
-from fsapi import init_filesystem, get_filesystem, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, S_IFMT, S_IFDIR, S_IFREG, S_IFLNK, S_IFIFO, S_IFCHR, S_IFBLK, S_IFSOCK, BLOCK_SIZE, Inode
+import time
+from fsapi import S_IFMT, init_filesystem, get_filesystem, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, S_IFDIR, S_IFREG, S_IFLNK, S_IFIFO, S_IFCHR, S_IFBLK, S_IFSOCK, BLOCK_SIZE, Inode, ExtentHeader, ExtentLeaf
 from rich import print
 import random
 import string
@@ -118,9 +118,6 @@ def handle_lsd(args, cwd):
     else:
         path = cwd
     try:
-        # Pre-resolve parent inode for performance
-        parent_inode_num = fs._resolve_path(path)
-        parent_inode = fs._get_inode(parent_inode_num)
         entries = fs.readdir(path)
         all_entries = sorted(entries)
 
@@ -130,26 +127,19 @@ def handle_lsd(args, cwd):
 
         for entry in all_entries:
             try:
-                found_inode_num = fs._find_file_in_directory(parent_inode, entry)
-                if found_inode_num is None:
-                    continue
-
-                inode = fs._get_inode(found_inode_num)
-
-                # For stat info, try to follow symlinks but handle broken ones
-                # Compute full path for stat
+                # Get all information through one stat call
                 entry_path = posixpath.join(path, entry)
-                try:
-                    stat_info = fs.stat(entry_path)
-                    inode_num = found_inode_num
-                except (FileNotFoundError, OSError):
-                    # Broken symlink - use the symlink inode itself
-                    stat_info = {"type": inode.mode & S_IFMT, "size": inode.size_lo}
-                    inode_num = found_inode_num
+                stat_info = fs.lstat(entry_path)
+                
+                inode_num = stat_info['inode']
+                mode = stat_info['mode']
+                links_count = stat_info['links_count']
+                uid = stat_info['uid']
+                gid = stat_info['gid']
+                size = stat_info['size']
 
                 # File type and permissions
-                mode = inode.mode
-                # type_char = 'd' if stat_info["type"] & S_IFDIR else 'l' if stat_info["type"] & S_IFLNK else 'f' if stat_info["type"] & S_IFREG else 'c' if stat_info["type"] & S_IFCHR else 'b' if stat_info["type"] & S_IFBLK else 'p' if stat_info["type"] & S_IFIFO else 's' if stat_info["type"] & S_IFSOCK else '-'
+                file_type = mode & S_IFMT  # Extract file type bits
                 type_char = {
                     S_IFDIR: 'd',
                     S_IFLNK: 'l',
@@ -158,7 +148,7 @@ def handle_lsd(args, cwd):
                     S_IFBLK: 'b',
                     S_IFIFO: 'p',
                     S_IFSOCK: 's'
-                }.get(stat_info["type"], '?')
+                }.get(file_type, '?')
 
                 # Convert to proper rwx format
                 owner_perms = f"{'r' if mode & 0o400 else '-'}{'w' if mode & 0o200 else '-'}{'x' if mode & 0o100 else '-'}"
@@ -166,7 +156,6 @@ def handle_lsd(args, cwd):
                 other_perms = f"{'r' if mode & 0o004 else '-'}{'w' if mode & 0o002 else '-'}{'x' if mode & 0o001 else '-'}"
 
                 # Human readable size
-                size = stat_info["size"]
                 if size < 1024:
                     size_str = f"{size}B"
                 elif size < 1024 * 1024:
@@ -177,12 +166,12 @@ def handle_lsd(args, cwd):
                     size_str = f"{size / (1024 * 1024 * 1024):.1f}G"
 
                 # Format entry name with color
-                if stat_info["type"] & S_IFDIR:
+                if file_type & S_IFDIR:
                     entry_display = f"[bold blue]{entry}[/bold blue]"
                 else:
                     entry_display = entry
 
-                print(f"{inode_num:5d} {type_char}{owner_perms}{group_perms}{other_perms} {inode.links_count:3d} {inode.uid:4d} {inode.gid:4d} {size_str:>7s} {entry_display}")
+                print(f"{inode_num:5d} {type_char}{owner_perms}{group_perms}{other_perms} {links_count:3d} {uid:4d} {gid:4d} {size_str:>7s} {entry_display}")
 
             except Exception as e:
                 print(f"lsd: error reading {entry}: {e}")
@@ -310,7 +299,7 @@ def handle_cp(args, cwd):
     try:
         # Check if source exists
         src_stat = fs.stat(src_path)
-        if src_stat["type"] == "directory":
+        if src_stat["mode"] & S_IFDIR:
             print("cp: directories not supported yet")
             return
 
@@ -338,7 +327,7 @@ def handle_mv(args, cwd):
         # Determine actual destination path: if dst_raw is directory, move inside it
         try:
             dst_stat = fs.stat(dst_raw)
-            if dst_stat["type"] & S_IFDIR:
+            if dst_stat["mode"] & S_IFDIR:
                 dst_path = posixpath.join(dst_raw, posixpath.basename(src_path))
             else:
                 dst_path = dst_raw
@@ -347,7 +336,7 @@ def handle_mv(args, cwd):
         # Copy + delete implementation
         # Check if source exists
         src_stat = fs.stat(src_path)
-        if src_stat["type"] == "directory":
+        if src_stat["mode"] & S_IFDIR:
             print("mv: directories not supported yet")
             return
 
@@ -505,9 +494,17 @@ def handle_ln(args, cwd):
     link_path = resolve_path(args[1], cwd)
 
     try:
+        # Check if link already exists
+        try:
+            fs.lstat(link_path)
+            print(f"ln: {link_path}: File exists")
+            return
+        except FileNotFoundError:
+            pass
+
         # Prevent hard link to directory
         target_stat = fs.stat(target_path)
-        if target_stat["type"] & S_IFDIR:
+        if target_stat["mode"] & S_IFDIR:
             print(f"ln: {target_path}: hard link not allowed for directory")
             return
         # Get target inode
@@ -544,6 +541,14 @@ def handle_lns(args, cwd):
     link_path = resolve_path(args[1], cwd)
 
     try:
+        # Check if link already exists
+        try:
+            fs.lstat(link_path)
+            print(f"lns: {link_path}: File exists")
+            return
+        except FileNotFoundError:
+            pass
+
         # Get parent directory of link
         link_parent = posixpath.dirname(link_path)
         link_name = posixpath.basename(link_path)
@@ -555,37 +560,60 @@ def handle_lns(args, cwd):
 
         # Allocate inode for symlink
         inode_num = fs._allocate_inode()
-
-        # Allocate block for symlink target
-        block = fs._allocate_block()
-
-        # Create symlink inode
         target_path_bytes = target_path.encode('utf-8')
         size = len(target_path_bytes)
-        inode = Inode(
-            mode=S_IFLNK | 0o777,
-            uid=0,
-            size_lo=size,
-            gid=0,
-            links_count=1,
-            size_high=0,
-            atime=0,
-            ctime=0,
-            mtime=0,
-            flags=0,
-            extent_count=1,
-            extents=[Extent(block, 1)] + [Extent(0, 0)] * 3,
-        )
 
-        fs._write_inode(inode_num, inode)
+        # Write symlink target directly into inode if it fits
+        if size <= 48:  # Inline symlink (extent_root is 48 bytes)
+            inode = Inode(
+                mode=S_IFLNK | 0o777,
+                uid=0,
+                size_lo=size,
+                gid=0,
+                links_count=1,
+                size_high=0,
+                atime=int(time.time()),
+                ctime=int(time.time()),
+                mtime=int(time.time()),
+                flags=0,
+                extent_root=target_path_bytes.ljust(48, b'\x00')  # Inline target in extent_root
+            )
+            fs._write_inode(inode_num, inode)
+        else:
+            # 1. Allocate block for data (path)
+            data_block = fs._allocate_block()
 
-        # Write target path to the block
-        fs.image_file.seek(block * BLOCK_SIZE)
-        fs.image_file.write(target_path_bytes)
-        fs.image_file.write(b"\x00" * (BLOCK_SIZE - size))
-        fs.image_file.flush()
+            # 2. Create extent tree with one entry
+            header = ExtentHeader(magic=0xF30A, entries_count=1, max_entries=3, depth=0)
+            leaf = ExtentLeaf(
+                logical_block=0,
+                block_count=1,
+                start_block_hi=(data_block >> 32),
+                start_block_lo=(data_block & 0xFFFFFFFF)
+            )
+            extent_root = header.pack() + leaf.pack() + b'\x00' * (48 - 12 - 8)
 
-        # Add to parent directory
+            # 3. Create inode with ready extent_root
+            inode = Inode(
+                mode=S_IFLNK | 0o777,
+                uid=0,
+                size_lo=size,  # Size is the length of the path
+                gid=0,
+                links_count=1,
+                size_high=0,
+                atime=int(time.time()),
+                ctime=int(time.time()),
+                mtime=int(time.time()),
+                flags=0,
+                extent_root=extent_root,
+            )
+            fs._write_inode(inode_num, inode)
+
+            # 4. Manually write path to the allocated block
+            fs.image_file.seek(data_block * BLOCK_SIZE)
+            fs.image_file.write(target_path_bytes)
+
+        # 5. Add entry to parent directory
         fs._add_directory_entry(parent_inode_num, link_name, inode_num, 7)  # 7 for symlink
 
     except Exception as e:
@@ -668,8 +696,14 @@ def handle_stat(args, cwd):
     path = resolve_path(args[0], cwd)
     try:
         stat_info = fs.stat(path)
-        inode_num = fs._resolve_path(path)
-        inode = fs._get_inode(inode_num)
+        inode_num = stat_info['inode']
+        links_count = stat_info['links_count']
+        uid = stat_info['uid']
+        gid = stat_info['gid']
+        mode = stat_info['mode']
+        atime = stat_info['atime']
+        mtime = stat_info['mtime']
+        ctime = stat_info['ctime']
 
         type_names = {
             S_IFDIR: "directory",
@@ -683,13 +717,51 @@ def handle_stat(args, cwd):
         print(f"  File: {path}")
         print(f"  Size: {stat_info['size']}\t\tBlocks: {(stat_info['size'] + 4095) // 4096}")
         print(f"  Type: {type_names.get(stat_info['type'], 'unknown')}")
-        print(f"Inode: {inode_num}\t\tLinks: {inode.links_count}")
-        print(f"Access: ({inode.mode & 0o777:04o})\t\tUid: {inode.uid}\t\tGid: {inode.gid}")
-        print(f"Access: {inode.atime}")
-        print(f"Modify: {inode.mtime}")
-        print(f"Change: {inode.ctime}")
+        print(f"Inode: {inode_num}\t\tLinks: {links_count}")
+        print(f"Access: ({mode & 0o777:04o})\t\tUid: {uid}\t\tGid: {gid}")
+        print(f"Access: {atime}")
+        print(f"Modify: {mtime}")
+        print(f"Change: {ctime}")
     except Exception as e:
         print(f"stat: {e}")
+
+@command('lstat', 'Display file or directory status without following symlinks')
+def handle_lstat(args, cwd):
+    fs = get_filesystem()
+    if not args:
+        print("lstat: missing operand")
+        return
+    path = resolve_path(args[0], cwd)
+    try:
+        stat_info = fs.lstat(path)
+        inode_num = stat_info['inode']
+        links_count = stat_info['links_count']
+        uid = stat_info['uid']
+        gid = stat_info['gid']
+        mode = stat_info['mode']
+        atime = stat_info['atime']
+        mtime = stat_info['mtime']
+        ctime = stat_info['ctime']
+
+        type_names = {
+            S_IFDIR: "directory",
+            S_IFLNK: "symbolic link",
+            S_IFREG: "regular file",
+            S_IFIFO: "fifo",
+            S_IFCHR: "character device",
+            S_IFBLK: "block device",
+            S_IFSOCK: "socket",
+        }
+        print(f"  File: {path}")
+        print(f"  Size: {stat_info['size']}\t\tBlocks: {(stat_info['size'] + 4095) // 4096}")
+        print(f"  Type: {type_names.get(stat_info['type'], 'unknown')}")
+        print(f"Inode: {inode_num}\t\tLinks: {links_count}")
+        print(f"Access: ({mode & 0o777:04o})\t\tUid: {uid}\t\tGid: {gid}")
+        print(f"Access: {atime}")
+        print(f"Modify: {mtime}")
+        print(f"Change: {ctime}")
+    except Exception as e:
+        print(f"lstat: {e}")
 
 if __name__ == "__main__":
     main()

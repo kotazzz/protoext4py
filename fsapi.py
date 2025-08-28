@@ -83,7 +83,7 @@ class DirEntry:
         )
 
         # Handle empty/end of directory entries
-        if inode_num == 0 or entry_len == 0:
+        if inode_num == 0 or entry_len == 0 or name_len == 0:
             return None, max(entry_len, len(data) - offset)
 
         if len(data) < offset + 12:
@@ -479,6 +479,8 @@ class FileSystem:
                             continue
                     entry, entry_len = result
                     if entry.name == filename:
+                        if entry.inode_num == 0:
+                            return None  # Skip deleted entries
                         return entry.inode_num
                     offset += entry_len
 
@@ -526,10 +528,26 @@ class FileSystem:
                 try:
                     result = DirEntry.unpack(bytes(block_data[offset:]), 0)
                     if result[0] is None:  # Empty entry
-                        entry_len = result[1]
-                        if entry_len >= len(entry_data):
-                            # Нашли подходящее место
-                            block_data[offset:offset + len(entry_data)] = entry_data
+                        old_entry_len = result[1]
+                        new_entry_len = len(entry_data)
+                        
+                        if old_entry_len >= new_entry_len:
+                            remaining_space = old_entry_len - new_entry_len
+                            
+                            # If remaining space is enough for a new empty entry (at least 12 bytes for header)
+                            if remaining_space >= 12:
+                                # Split the slot: use part for new entry, create new empty slot for remainder
+                                block_data[offset:offset + new_entry_len] = entry_data
+                                
+                                # Create new empty entry in the remaining space
+                                empty_entry_header = struct.pack("<III", 0, remaining_space, 0)
+                                block_data[offset + new_entry_len:offset + new_entry_len + 12] = empty_entry_header
+                            else:
+                                # Not enough space to split, use entire slot
+                                block_data[offset:offset + old_entry_len] = entry_data
+                                # Update entry_len in the packed data to match the full slot
+                                struct.pack_into("<I", block_data, offset + 4, old_entry_len)
+                            
                             self.image_file.seek(physical_block * BLOCK_SIZE)
                             self.image_file.write(block_data)
                             self.image_file.flush()
@@ -674,26 +692,45 @@ class FileSystem:
 
             # Parse directory entries
             offset = 0
+            prev_entry_offset = -1
+            prev_entry_len = 0
+
             while offset < len(block_data):
                 try:
-                    result = DirEntry.unpack(bytes(block_data[offset:]), 0)
-                    if result[0] is None:  # Empty entry or end of directory
-                        if result[1] == 0:
-                            break
-                        else:
+                    # Читаем текущую запись, чтобы получить ее длину
+                    result = DirEntry.unpack(bytes(block_data), offset)
+                    if result[0] is None:
+                        # Дошли до конца или пустой области
+                        if result[1] > 0:
                             offset += result[1]
                             continue
+                        else:
+                            break
+                    
                     entry, entry_len = result
+                    
                     if entry.name == filename:
-                        # Clear the entry by setting inode_num to 0
-                        block_data[offset:offset + 4] = b'\x00\x00\x00\x00'
+                        # Нашли запись для удаления
+                        if prev_entry_offset != -1:
+                            # Есть предыдущая запись, "поглощаем" текущую
+                            # Новая длина предыдущей записи = ее старая длина + длина удаляемой
+                            new_prev_len = prev_entry_len + entry_len
+                            struct.pack_into("<I", block_data, prev_entry_offset + 4, new_prev_len)
+                        else:
+                            # Это первая запись в блоке, просто зануляем ее inode
+                            struct.pack_into("<I", block_data, offset, 0)
+                        
+                        # Записываем измененный блок и выходим
                         self.image_file.seek(physical_block * BLOCK_SIZE)
                         self.image_file.write(block_data)
-                        self.image_file.flush()
                         return
+
+                    # Запоминаем текущую запись как предыдущую для следующей итерации
+                    prev_entry_offset = offset
+                    prev_entry_len = entry_len
                     offset += entry_len
 
-                    if entry_len == 0:  # Prevent infinite loop
+                    if entry_len == 0:
                         break
                 except (ValueError, UnicodeDecodeError):
                     break
@@ -702,7 +739,7 @@ class FileSystem:
 
         raise FileNotFoundError(f"No such file or directory: {filename}")
 
-    def _resolve_path(self, path: str, *, _depth: int = 0) -> int:
+    def _resolve_path(self, path: str, *, follow_links: bool = True, _depth: int = 0) -> int:
         """Resolve path to inode number with symlink depth protection"""
         MAX_SYMLINK_DEPTH = 16
         if _depth > MAX_SYMLINK_DEPTH:
@@ -715,7 +752,7 @@ class FileSystem:
 
         current_inode_num = ROOT_INODE
 
-        for component in components:
+        for i, component in enumerate(components):
             if not component:  # Skip empty components
                 continue
 
@@ -730,32 +767,41 @@ class FileSystem:
 
             # Check if it's a symlink
             found_inode = self._get_inode(found_inode_num)
-            if (found_inode.mode & S_IFMT) == S_IFLNK:
-                # Read the target path through extent tree
+            is_last_component = (i == len(components) - 1)
+            
+            if (found_inode.mode & S_IFMT) == S_IFLNK and (follow_links or not is_last_component):
+                # Read the target path
                 target_data = b""
                 file_size = found_inode.size_lo | (found_inode.size_high << 32)
-                bytes_read = 0
-                while bytes_read < file_size:
-                    logical_block = bytes_read // BLOCK_SIZE
-                    leaf = self._find_extent(found_inode, logical_block)
-                    if leaf is None:
-                        break
-                    block_offset_in_extent = logical_block - leaf.logical_block
-                    physical_block = leaf.get_start_block() + block_offset_in_extent
-                    self.image_file.seek(physical_block * BLOCK_SIZE)
-                    block_data = self.image_file.read(BLOCK_SIZE)
-                    null_pos = block_data.find(b"\x00")
-                    if null_pos != -1:
-                        target_data += block_data[:null_pos]
-                        break
-                    else:
-                        target_data += block_data
-                    bytes_read += BLOCK_SIZE
+                
+                # Check if it's an inline symlink (no valid extents in extent_root)
+                if self._find_extent(found_inode, 0) is None and file_size > 0:
+                    # Inline symlink: data is directly in extent_root
+                    target_data = found_inode.extent_root[:file_size].rstrip(b'\x00')
+                else:
+                    # Regular symlink: read data through extent tree
+                    bytes_read = 0
+                    while bytes_read < file_size:
+                        logical_block = bytes_read // BLOCK_SIZE
+                        leaf = self._find_extent(found_inode, logical_block)
+                        if leaf is None:
+                            break
+                        block_offset_in_extent = logical_block - leaf.logical_block
+                        physical_block = leaf.get_start_block() + block_offset_in_extent
+                        self.image_file.seek(physical_block * BLOCK_SIZE)
+                        block_data = self.image_file.read(BLOCK_SIZE)
+                        null_pos = block_data.find(b"\x00")
+                        if null_pos != -1:
+                            target_data += block_data[:null_pos]
+                            break
+                        else:
+                            target_data += block_data
+                        bytes_read += BLOCK_SIZE
                 target_path = target_data.decode('utf-8').strip()
                 # Only resolve if target_path looks like a valid path
                 if target_path.startswith('/') or not any(c in target_path for c in ['\n', '\r']):
                     # Resolve the target with increased depth
-                    found_inode_num = self._resolve_path(target_path, _depth=_depth + 1)
+                    found_inode_num = self._resolve_path(target_path, follow_links=True, _depth=_depth + 1)
                 else:
                     # This is not a symlink target but file content, treat as regular file
                     pass
@@ -867,25 +913,31 @@ class FileSystem:
         # If it's a symlink, read the target path
         if (inode.mode & S_IFMT) == S_IFLNK:
             target_data = b""
-            # Читаем данные через B+ дерево
             file_size = inode.size_lo | (inode.size_high << 32)
-            bytes_read = 0
-            while bytes_read < file_size:
-                logical_block = bytes_read // BLOCK_SIZE
-                leaf = self._find_extent(inode, logical_block)
-                if leaf is None:
-                    break
-                block_offset_in_extent = logical_block - leaf.logical_block
-                physical_block = leaf.get_start_block() + block_offset_in_extent
-                self.image_file.seek(physical_block * BLOCK_SIZE)
-                block_data = self.image_file.read(BLOCK_SIZE)
-                null_pos = block_data.find(b"\x00")
-                if null_pos != -1:
-                    target_data += block_data[:null_pos]
-                    break
-                else:
-                    target_data += block_data
-                bytes_read += BLOCK_SIZE
+            
+            # Check if it's an inline symlink (no valid extents in extent_root)
+            if self._find_extent(inode, 0) is None and file_size > 0:
+                # Inline symlink: data is directly in extent_root
+                target_data = inode.extent_root[:file_size].rstrip(b'\x00')
+            else:
+                # Regular symlink: read data through extent tree
+                bytes_read = 0
+                while bytes_read < file_size:
+                    logical_block = bytes_read // BLOCK_SIZE
+                    leaf = self._find_extent(inode, logical_block)
+                    if leaf is None:
+                        break
+                    block_offset_in_extent = logical_block - leaf.logical_block
+                    physical_block = leaf.get_start_block() + block_offset_in_extent
+                    self.image_file.seek(physical_block * BLOCK_SIZE)
+                    block_data = self.image_file.read(BLOCK_SIZE)
+                    null_pos = block_data.find(b"\x00")
+                    if null_pos != -1:
+                        target_data += block_data[:null_pos]
+                        break
+                    else:
+                        target_data += block_data
+                    bytes_read += BLOCK_SIZE
             # Use provided offset or file descriptor offset
             read_offset = offset if offset is not None else file_desc.offset
             if read_offset >= len(target_data):
@@ -1056,15 +1108,19 @@ class FileSystem:
 
         file_inode = self._get_inode(file_inode_num)
 
-        # Can only unlink regular files
-        if not ((file_inode.mode & S_IFMT) == S_IFREG):
-            raise OSError("Not a regular file")
+        # Can only unlink regular files or symbolic links
+        file_type = file_inode.mode & S_IFMT
+        if not (file_type == S_IFREG or file_type == S_IFLNK):
+            raise OSError("Can only unlink regular files or symbolic links")
 
         # Remove from directory
         self._remove_directory_entry(parent_inode_num, filename)
         
         # Decrease links count
         file_inode.links_count -= 1
+
+        # Always write the updated inode
+        self._write_inode(file_inode_num, file_inode)
 
         # Check if inode has no links and is not open by any descriptor
         is_open = any(fd.inode_num == file_inode_num for fd in self.open_files.values())
@@ -1073,9 +1129,6 @@ class FileSystem:
             # Free blocks and inode only when no links and no open descriptors
             self._free_inode_blocks(file_inode)
             self._free_inode(file_inode_num)
-        else:
-            # Just update the inode metadata
-            self._write_inode(file_inode_num, file_inode)
 
     def mkdir(self, path: str, mode: int = 0o755):
         """Create directory"""
@@ -1277,7 +1330,7 @@ class FileSystem:
                             offset += result[1]
                             continue
                     entry, entry_len = result
-                    if entry.name and entry.name not in [".", ".."]:
+                    if entry.inode_num != 0 and entry.name and entry.name not in [".", ".."]:
                         entries.append(entry.name)
                     offset += entry_len
 
@@ -1293,6 +1346,26 @@ class FileSystem:
     def stat(self, path: str) -> Dict[str, Union[int, str]]:
         """Get file/directory metadata"""
         inode_num = self._resolve_path(path)
+        inode = self._get_inode(inode_num)
+
+        file_size = inode.size_lo | (inode.size_high << 32)
+
+        return {
+            "inode": inode_num,
+            "mode": inode.mode,
+            "size": file_size,
+            "uid": inode.uid,
+            "gid": inode.gid,
+            "atime": inode.atime,
+            "ctime": inode.ctime,
+            "mtime": inode.mtime,
+            "links_count": inode.links_count,
+            "type": inode.mode & S_IFMT,
+        }
+
+    def lstat(self, path: str) -> Dict[str, Union[int, str]]:
+        """Get file/directory metadata without following symlinks"""
+        inode_num = self._resolve_path(path, follow_links=False)
         inode = self._get_inode(inode_num)
 
         file_size = inode.size_lo | (inode.size_high << 32)
@@ -1712,3 +1785,7 @@ def readdir(path: str) -> List[str]:
 
 def stat(path: str) -> Dict[str, Union[int, str]]:
     return get_filesystem().stat(path)
+
+
+def lstat(path: str) -> Dict[str, Union[int, str]]:
+    return get_filesystem().lstat(path)
