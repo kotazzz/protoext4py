@@ -1,6 +1,6 @@
 import os
 import struct
-from fs import INODE_SIZE, Extent, Superblock, GroupDesc, Inode
+from fs import INODE_SIZE, Superblock, GroupDesc, Inode
 
 # CONSTANTS
 BLOCK_SIZE = 4096
@@ -84,7 +84,6 @@ def create_superblock(f, block_count: int, num_groups: int, total_inodes: int):
 def create_block_groups(f, num_groups: int, block_count: int):
     """Create block group descriptors and initialize bitmaps"""
     group_descriptors = []
-    current_block = 2  # after sb and gd
 
     inodes_per_block = BLOCK_SIZE // INODE_SIZE
     inode_table_blocks = (INODES_PER_GROUP + inodes_per_block - 1) // inodes_per_block
@@ -101,9 +100,9 @@ def create_block_groups(f, num_groups: int, block_count: int):
             inode_table_block = group_start_block + 2
 
         if group_num == 0:
-            current_block = inode_table_block + inode_table_blocks
+            pass
         else:
-            current_block = inode_table_block + inode_table_blocks
+            pass
 
         blocks_in_group = min(BLOCKS_PER_GROUP, block_count - group_num * BLOCKS_PER_GROUP)
         free_blocks_count = blocks_in_group - (3 + inode_table_blocks)
@@ -181,7 +180,20 @@ def create_root_inode(f):
         group_desc.inode_table_block * BLOCK_SIZE + 1 * INODE_SIZE
     )  # inode #2 is at index 1
 
-    # Create root directory inode
+    # Calculate root directory block
+    root_dir_block = group_desc.inode_table_block + ((INODES_PER_GROUP * INODE_SIZE + BLOCK_SIZE - 1) // BLOCK_SIZE)
+
+    # Create root directory inode with extent tree
+    from fs import ExtentHeader, ExtentLeaf
+    header = ExtentHeader(magic=0xF30A, entries_count=1, max_entries=3, depth=0)
+    leaf = ExtentLeaf(
+        logical_block=0,
+        block_count=1,
+        start_block_hi=(root_dir_block >> 32),
+        start_block_lo=(root_dir_block & 0xFFFFFFFF)
+    )
+    extent_root = header.pack() + leaf.pack() + b'\x00' * (48 - len(header.pack()) - len(leaf.pack()))
+
     root_inode = Inode(
         mode=0o040755,  # Directory with 755 permissions (S_IFDIR | 0755)
         uid=0,  # Root user
@@ -193,17 +205,7 @@ def create_root_inode(f):
         ctime=0,  # Creation time
         mtime=0,  # Modification time
         flags=0,
-        extent_count=1,
-        extents=[
-            Extent(
-                start_block=group_desc.inode_table_block
-                + ((INODES_PER_GROUP * INODE_SIZE + BLOCK_SIZE - 1) // BLOCK_SIZE),
-                block_count=1,
-            ),  # One block for root directory
-            Extent(0, 0),
-            Extent(0, 0),
-            Extent(0, 0),
-        ],
+        extent_root=extent_root,
     )
 
     # Write root inode
@@ -211,7 +213,6 @@ def create_root_inode(f):
     f.write(root_inode.pack())
 
     # Initialize root directory block with . and .. entries
-    root_dir_block = root_inode.extents[0].start_block
     f.seek(root_dir_block * BLOCK_SIZE)
 
     # Create . entry (points to itself - inode 2)

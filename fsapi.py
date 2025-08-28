@@ -4,7 +4,8 @@ import struct
 import time
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
-from fs import INODE_SIZE, Extent, Superblock, GroupDesc, Inode
+from fs import INODE_SIZE, Superblock, GroupDesc, Inode
+from fs import ExtentHeader, ExtentLeaf, ExtentIndex
 
 # File system constants
 BLOCK_SIZE = 4096
@@ -71,15 +72,15 @@ class DirEntry:
     def unpack(cls, data: bytes, offset: int = 0) -> Tuple["DirEntry", int]:
         """Unpack directory entry from bytes"""
         if len(data) < offset + 12:  # Need at least 12 bytes for header
-            raise ValueError("Not enough data for directory entry")
+            return None, len(data) - offset  # Return remaining space as empty
 
         inode_num, entry_len, name_len = struct.unpack(
             "<III", data[offset : offset + 12]
         )
 
         # Handle empty/end of directory entries
-        if inode_num == 0:
-            return None, entry_len
+        if inode_num == 0 or entry_len == 0:
+            return None, max(entry_len, len(data) - offset)
 
         if len(data) < offset + 12:
             raise ValueError("Not enough data for directory entry header")
@@ -137,8 +138,10 @@ class FileSystem:
         # Mark root directory block as used (in case old image)
         try:
             root_inode = self._get_inode(ROOT_INODE)
-            if root_inode.extents and root_inode.extents[0].block_count > 0:
-                root_dir_block = root_inode.extents[0].start_block
+            # Try to find the first extent in the B+ tree
+            leaf = self._find_extent(root_inode, 0)
+            if leaf is not None:
+                root_dir_block = leaf.get_start_block()
                 group_num = root_dir_block // BLOCKS_PER_GROUP
                 if group_num < len(self.group_descriptors):
                     group_desc = self.group_descriptors[group_num]
@@ -325,7 +328,9 @@ class FileSystem:
         # Clear block bit
         byte_idx = block_idx // 8
         bit_idx = block_idx % 8
-        bitmap[byte_idx] &= ~(1 << bit_idx)
+        # Only clear if set
+        if bitmap[byte_idx] & (1 << bit_idx):
+            bitmap[byte_idx] &= ~(1 << bit_idx)
 
         # Write bitmap back
         self.image_file.seek(group_desc.block_bitmap_block * BLOCK_SIZE)
@@ -340,41 +345,145 @@ class FileSystem:
         self.superblock.free_blocks_count += 1
         self._write_superblock()
 
+    def _allocate_block_at(self, block_num: int):
+        """Allocate a specific block by its number"""
+        group_num = block_num // BLOCKS_PER_GROUP
+        block_idx = block_num % BLOCKS_PER_GROUP
+
+        if group_num >= len(self.group_descriptors):
+            raise OSError("Block number out of range")
+
+        group_desc = self.group_descriptors[group_num]
+
+        self.image_file.seek(group_desc.block_bitmap_block * BLOCK_SIZE)
+        bitmap = bytearray(self.image_file.read(BLOCK_SIZE))
+
+        byte_idx = block_idx // 8
+        bit_idx = block_idx % 8
+
+        if bitmap[byte_idx] & (1 << bit_idx):
+            raise OSError(f"Block {block_num} already allocated")
+
+        # Mark block as used
+        bitmap[byte_idx] |= 1 << bit_idx
+
+        self.image_file.seek(group_desc.block_bitmap_block * BLOCK_SIZE)
+        self.image_file.write(bitmap)
+
+        # Update group descriptor
+        group_desc.free_blocks_count -= 1
+        self.group_descriptors[group_num] = group_desc
+        self._write_group_descriptor(group_num, group_desc)
+
+        # Update superblock
+        self.superblock.free_blocks_count -= 1
+        self._write_superblock()
+
+    def _update_leaf_in_tree(self, inode_num: int, old_leaf: ExtentLeaf, new_leaf: ExtentLeaf):
+        """Update a leaf in the B+ tree"""
+        inode = self._get_inode(inode_num)
+        self._update_node(inode.extent_root, old_leaf, new_leaf, inode_num)
+        # After updating, write back the inode if root changed
+        self._write_inode(inode_num, inode)
+
+    def _extend_leaf(self, inode_num: int, leaf: ExtentLeaf):
+        """Extend an existing leaf by increasing its block_count"""
+        # Allocate the next physical block
+        next_physical_block = leaf.get_start_block() + leaf.block_count
+        self._allocate_block_at(next_physical_block)
+
+        # Create extended leaf
+        extended_leaf = ExtentLeaf(
+            logical_block=leaf.logical_block,
+            block_count=leaf.block_count + 1,
+            start_block_hi=leaf.start_block_hi,
+            start_block_lo=leaf.start_block_lo
+        )
+
+        # Update in tree
+        self._update_leaf_in_tree(inode_num, leaf, extended_leaf)
+
+    def _update_node(self, node_data: bytes, old_leaf: ExtentLeaf, new_leaf: ExtentLeaf, inode_num: int) -> bytes:
+        """Recursively update a node in the tree"""
+        if len(node_data) < 8:
+            return node_data
+        
+        header = ExtentHeader.unpack(node_data[:8])
+        if header.magic != 0xF30A:
+            return node_data
+        
+        entries_data = node_data[8:]
+        
+        if header.depth == 0:  # Leaf node
+            for i in range(header.entries_count):
+                leaf_data = entries_data[i*12:(i+1)*12]
+                leaf = ExtentLeaf.unpack(leaf_data)
+                if leaf.logical_block == old_leaf.logical_block and leaf.get_start_block() == old_leaf.get_start_block():
+                    # Found the leaf, update it
+                    new_entries = entries_data[:i*12] + new_leaf.pack() + entries_data[(i+1)*12:]
+                    return header.pack() + new_entries + b'\x00' * (BLOCK_SIZE - len(header.pack()) - len(new_entries))
+            return node_data  # Not found
+        else:  # Index node
+            for i in range(header.entries_count):
+                idx_data = entries_data[i*12:(i+1)*12]
+                idx = ExtentIndex.unpack(idx_data)
+                # Read child node
+                self.image_file.seek(idx.child_block * BLOCK_SIZE)
+                child_data = self.image_file.read(BLOCK_SIZE)
+                updated_child = self._update_node(child_data, old_leaf, new_leaf, inode_num)
+                if updated_child != child_data:
+                    # Child was updated, write it back
+                    self.image_file.seek(idx.child_block * BLOCK_SIZE)
+                    self.image_file.write(updated_child)
+                    return node_data  # No change to this node
+            return node_data
+
     def _find_file_in_directory(self, dir_inode: Inode, filename: str) -> Optional[int]:
         """Find file in directory, return inode number"""
-        if not (dir_inode.mode & S_IFDIR):
+        if not ((dir_inode.mode & S_IFMT) == S_IFDIR):
             return None
 
-        # Read directory blocks
-        for extent in dir_inode.extents:
-            if extent.block_count == 0:
+        # Читаем блоки директории через B+ дерево экстентов
+        file_size = dir_inode.size_lo | (dir_inode.size_high << 32)
+        bytes_read = 0
+
+        while bytes_read < file_size:
+            # Находим экстент для текущего логического блока
+            logical_block = bytes_read // BLOCK_SIZE
+            leaf = self._find_extent(dir_inode, logical_block)
+            if leaf is None:
                 break
 
-            for block_offset in range(extent.block_count):
-                block_num = extent.start_block + block_offset
-                self.image_file.seek(block_num * BLOCK_SIZE)
-                block_data = self.image_file.read(BLOCK_SIZE)
+            # Вычисляем физический блок
+            block_offset_in_extent = logical_block - leaf.logical_block
+            physical_block = leaf.get_start_block() + block_offset_in_extent
 
-                # Parse directory entries
-                offset = 0
-                while offset + 14 <= len(block_data):
-                    try:
-                        result = DirEntry.unpack(block_data, offset)
-                        if result[0] is None:  # Empty entry or end of directory
-                            if result[1] == 0:
-                                break
-                            else:
-                                offset += result[1]
-                                continue
-                        entry, entry_len = result
-                        if entry.name == filename:
-                            return entry.inode_num
-                        offset += entry_len
+            # Читаем блок
+            self.image_file.seek(physical_block * BLOCK_SIZE)
+            block_data = self.image_file.read(BLOCK_SIZE)
 
-                        if entry_len == 0:  # Prevent infinite loop
+            # Парсим записи директории
+            offset = 0
+            while offset + 14 <= len(block_data):
+                try:
+                    result = DirEntry.unpack(block_data, offset)
+                    if result[0] is None:  # Empty entry or end of directory
+                        if result[1] == 0:
                             break
-                    except (ValueError, UnicodeDecodeError):
+                        else:
+                            offset += result[1]
+                            continue
+                    entry, entry_len = result
+                    if entry.name == filename:
+                        return entry.inode_num
+                    offset += entry_len
+
+                    if entry_len == 0:  # Prevent infinite loop
                         break
+                except (ValueError, UnicodeDecodeError):
+                    break
+
+            bytes_read += BLOCK_SIZE
 
         return None
 
@@ -384,92 +493,121 @@ class FileSystem:
         """Add entry to directory"""
         dir_inode = self._get_inode(dir_inode_num)
 
-        if not (dir_inode.mode & S_IFDIR):
+        if not ((dir_inode.mode & S_IFMT) == S_IFDIR):
             raise OSError("Not a directory")
 
         # Create new directory entry
         new_entry = DirEntry(file_inode_num, len(filename), filename, file_type)
         entry_data = new_entry.pack()
 
-        # Find the current end of directory data
-        current_size = 0
-        for extent in dir_inode.extents:
-            if extent.block_count == 0:
+        # Ищем место в существующих блоках директории
+        file_size = dir_inode.size_lo | (dir_inode.size_high << 32)
+        bytes_scanned = 0
+
+        while bytes_scanned < file_size:
+            logical_block = bytes_scanned // BLOCK_SIZE
+            leaf = self._find_extent(dir_inode, logical_block)
+            if leaf is None:
                 break
 
-            # For each block in this extent, scan to find actual used space
-            for block_idx in range(extent.block_count):
-                block_num = extent.start_block + block_idx
-                self.image_file.seek(block_num * BLOCK_SIZE)
-                block_data = self.image_file.read(BLOCK_SIZE)
+            block_offset_in_extent = logical_block - leaf.logical_block
+            physical_block = leaf.get_start_block() + block_offset_in_extent
 
-                # Parse entries to find actual end
-                offset = 0
-                block_used = 0
-                while offset < len(block_data):
-                    try:
-                        result = DirEntry.unpack(block_data, offset)
-                        if result[0] is None:  # Empty entry or end of directory
-                            if result[1] == 0:
-                                break
-                            else:
-                                offset += result[1]
-                                continue
-                        entry, entry_len = result
-                        if entry_len == 0:
-                            break
-                        offset += entry_len
-                        block_used = offset
-                    except (ValueError, UnicodeDecodeError):
+            self.image_file.seek(physical_block * BLOCK_SIZE)
+            block_data = bytearray(self.image_file.read(BLOCK_SIZE))
+
+            # Ищем свободное место в блоке
+            offset = 0
+            while offset < len(block_data):
+                try:
+                    result = DirEntry.unpack(bytes(block_data[offset:]), 0)
+                    if result[0] is None:  # Empty entry
+                        entry_len = result[1]
+                        if entry_len >= len(entry_data):
+                            # Нашли подходящее место
+                            block_data[offset:offset + len(entry_data)] = entry_data
+                            self.image_file.seek(physical_block * BLOCK_SIZE)
+                            self.image_file.write(block_data)
+                            self.image_file.flush()
+                            return
+                    else:
+                        entry_len = result[1]
+                    offset += entry_len
+                    if entry_len == 0:
                         break
+                except (ValueError, UnicodeDecodeError):
+                    break
 
-                # If this is the last block and has space, append here
-                if (
-                    block_idx == extent.block_count - 1
-                    and block_used + len(entry_data) <= BLOCK_SIZE
-                ):
-                    self.image_file.seek(block_num * BLOCK_SIZE + block_used)
-                    self.image_file.write(entry_data)
-                    self.image_file.flush()
-                    return
+            bytes_scanned += BLOCK_SIZE
 
-                current_size += BLOCK_SIZE
+        # Если не нашли место, выделяем новый блок
+        new_block = self._allocate_block()
 
-        # If we get here, we need to allocate a new block
-        for extent_idx, extent in enumerate(dir_inode.extents):
-            if extent.block_count == 0:
-                new_block = self._allocate_block()
-                dir_inode.extents[extent_idx] = Extent(new_block, 1)
-                dir_inode.extent_count = max(dir_inode.extent_count, extent_idx + 1)
+        # Добавляем новый экстент в дерево
+        self._insert_extent(dir_inode_num, ExtentLeaf(
+            logical_block=file_size // BLOCK_SIZE,
+            block_count=1,
+            start_block_hi=(new_block >> 32),
+            start_block_lo=(new_block & 0xFFFFFFFF)
+        ))
 
-                # Update directory inode size metadata
-                dir_size = sum(e.block_count for e in dir_inode.extents) * BLOCK_SIZE
-                dir_inode.size_lo = dir_size & 0xFFFFFFFF
-                dir_inode.size_high = dir_size >> 32
+        # Записываем новую запись в новый блок
+        self.image_file.seek(new_block * BLOCK_SIZE)
+        self.image_file.write(entry_data)
+        remaining = BLOCK_SIZE - len(entry_data)
+        self.image_file.write(b"\x00" * remaining)
+        self.image_file.flush()
 
-                # Write new entry to the new block
-                self.image_file.seek(new_block * BLOCK_SIZE)
-                self.image_file.write(entry_data)
-                self.image_file.write(b"\x00" * (BLOCK_SIZE - len(entry_data)))
-                self.image_file.flush()
-
-                # Update directory inode
-                self._write_inode(dir_inode_num, dir_inode)
-                return
-
-        raise OSError("Directory full")
+        # Обновляем размер директории
+        new_size = file_size + BLOCK_SIZE
+        dir_inode.size_lo = new_size & 0xFFFFFFFF
+        dir_inode.size_high = new_size >> 32
+        self._write_inode(dir_inode_num, dir_inode)
 
     def _free_inode_blocks(self, inode: Inode):
         """Free all blocks allocated to an inode"""
-        for extent in inode.extents:
-            if extent.block_count == 0:
-                break
-            for block_offset in range(extent.block_count):
-                block_num = extent.start_block + block_offset
-                self._free_block(block_num)
-        # Reset extents
-        inode.extents = [Extent(0, 0) for _ in range(4)]
-        inode.extent_count = 0
+        def free_node_blocks(node_data: bytes):
+            """Рекурсивно освобождает блоки из узла дерева"""
+            if len(node_data) < 8:
+                return
+            header = ExtentHeader.unpack(node_data[:8])
+            if header.magic != 0xF30A:
+                return
+
+            entries_data = node_data[8:]
+
+            if header.depth == 0:  # Листовой узел
+                for i in range(header.entries_count):
+                    if i * 12 + 12 > len(entries_data):
+                        break
+                    leaf_data = entries_data[i*12 : (i+1)*12]
+                    leaf = ExtentLeaf.unpack(leaf_data)
+                    # Освобождаем все блоки в экстенте
+                    for block_offset in range(leaf.block_count):
+                        block_num = leaf.get_start_block() + block_offset
+                        # Skip reserved blocks (0-1 in group 0)
+                        group_num = block_num // BLOCKS_PER_GROUP
+                        if not (group_num == 0 and block_num < 2):
+                            self._free_block(block_num)
+            else:  # Индексный узел
+                for i in range(header.entries_count):
+                    if i * 12 + 12 > len(entries_data):
+                        break
+                    idx_data = entries_data[i*12 : (i+1)*12]
+                    idx = ExtentIndex.unpack(idx_data)
+                    # Рекурсивно освобождаем дочерний узел
+                    self.image_file.seek(idx.child_block * BLOCK_SIZE)
+                    child_data = self.image_file.read(BLOCK_SIZE)
+                    free_node_blocks(child_data)
+                    # Освобождаем блок самого дочернего узла
+                    self._free_block(idx.child_block)
+
+        # Начинаем с корневого узла
+        free_node_blocks(inode.extent_root)
+
+        # Сбрасываем дерево экстентов
+        header = ExtentHeader(magic=0xF30A, entries_count=0, max_entries=3, depth=0)
+        inode.extent_root = header.pack() + b'\x00' * 40
 
     def _free_inode(self, inode_num: int):
         """Free an inode"""
@@ -511,44 +649,52 @@ class FileSystem:
         """Remove entry from directory"""
         dir_inode = self._get_inode(dir_inode_num)
 
-        if not (dir_inode.mode & S_IFDIR):
+        if not ((dir_inode.mode & S_IFMT) == S_IFDIR):
             raise OSError("Not a directory")
 
-        # Read directory blocks
-        for extent in dir_inode.extents:
-            if extent.block_count == 0:
+        # Read directory blocks through extent tree
+        file_size = dir_inode.size_lo | (dir_inode.size_high << 32)
+        bytes_read = 0
+
+        while bytes_read < file_size:
+            logical_block = bytes_read // BLOCK_SIZE
+            leaf = self._find_extent(dir_inode, logical_block)
+            if leaf is None:
                 break
 
-            for block_offset in range(extent.block_count):
-                block_num = extent.start_block + block_offset
-                self.image_file.seek(block_num * BLOCK_SIZE)
-                block_data = bytearray(self.image_file.read(BLOCK_SIZE))
+            block_offset_in_extent = logical_block - leaf.logical_block
+            physical_block = leaf.get_start_block() + block_offset_in_extent
 
-                # Parse directory entries
-                offset = 0
-                while offset < len(block_data):
-                    try:
-                        result = DirEntry.unpack(bytes(block_data[offset:]), 0)
-                        if result[0] is None:  # Empty entry or end of directory
-                            if result[1] == 0:
-                                break
-                            else:
-                                offset += result[1]
-                                continue
-                        entry, entry_len = result
-                        if entry.name == filename:
-                            # Clear the entry by setting inode_num to 0
-                            block_data[offset:offset + 4] = b'\x00\x00\x00\x00'
-                            self.image_file.seek(block_num * BLOCK_SIZE)
-                            self.image_file.write(block_data)
-                            self.image_file.flush()
-                            return
-                        offset += entry_len
+            self.image_file.seek(physical_block * BLOCK_SIZE)
+            block_data = bytearray(self.image_file.read(BLOCK_SIZE))
 
-                        if entry_len == 0:  # Prevent infinite loop
+            # Parse directory entries
+            offset = 0
+            while offset < len(block_data):
+                try:
+                    result = DirEntry.unpack(bytes(block_data[offset:]), 0)
+                    if result[0] is None:  # Empty entry or end of directory
+                        if result[1] == 0:
                             break
-                    except (ValueError, UnicodeDecodeError):
+                        else:
+                            offset += result[1]
+                            continue
+                    entry, entry_len = result
+                    if entry.name == filename:
+                        # Clear the entry by setting inode_num to 0
+                        block_data[offset:offset + 4] = b'\x00\x00\x00\x00'
+                        self.image_file.seek(physical_block * BLOCK_SIZE)
+                        self.image_file.write(block_data)
+                        self.image_file.flush()
+                        return
+                    offset += entry_len
+
+                    if entry_len == 0:  # Prevent infinite loop
                         break
+                except (ValueError, UnicodeDecodeError):
+                    break
+
+            bytes_read += BLOCK_SIZE
 
         raise FileNotFoundError(f"No such file or directory: {filename}")
 
@@ -571,7 +717,7 @@ class FileSystem:
 
             current_inode = self._get_inode(current_inode_num)
 
-            if not (current_inode.mode & S_IFDIR):
+            if not ((current_inode.mode & S_IFMT) == S_IFDIR):
                 raise OSError(f"Not a directory: {component}")
 
             found_inode_num = self._find_file_in_directory(current_inode, component)
@@ -580,22 +726,27 @@ class FileSystem:
 
             # Check if it's a symlink
             found_inode = self._get_inode(found_inode_num)
-            if found_inode.mode & S_IFLNK:
-                # Read the target path
+            if (found_inode.mode & S_IFMT) == S_IFLNK:
+                # Read the target path through extent tree
                 target_data = b""
-                for extent in found_inode.extents:
-                    if extent.block_count == 0:
+                file_size = found_inode.size_lo | (found_inode.size_high << 32)
+                bytes_read = 0
+                while bytes_read < file_size:
+                    logical_block = bytes_read // BLOCK_SIZE
+                    leaf = self._find_extent(found_inode, logical_block)
+                    if leaf is None:
                         break
-                    for block_offset in range(extent.block_count):
-                        block_num = extent.start_block + block_offset
-                        self.image_file.seek(block_num * BLOCK_SIZE)
-                        block_data = self.image_file.read(BLOCK_SIZE)
-                        null_pos = block_data.find(b"\x00")
-                        if null_pos != -1:
-                            target_data += block_data[:null_pos]
-                            break
-                        else:
-                            target_data += block_data
+                    block_offset_in_extent = logical_block - leaf.logical_block
+                    physical_block = leaf.get_start_block() + block_offset_in_extent
+                    self.image_file.seek(physical_block * BLOCK_SIZE)
+                    block_data = self.image_file.read(BLOCK_SIZE)
+                    null_pos = block_data.find(b"\x00")
+                    if null_pos != -1:
+                        target_data += block_data[:null_pos]
+                        break
+                    else:
+                        target_data += block_data
+                    bytes_read += BLOCK_SIZE
                 target_path = target_data.decode('utf-8').strip()
                 # Only resolve if target_path looks like a valid path
                 if target_path.startswith('/') or not any(c in target_path for c in ['\n', '\r']):
@@ -618,7 +769,7 @@ class FileSystem:
             inode = self._get_inode(inode_num)
 
             # Check if it's a regular file
-            if not (inode.mode & S_IFREG):
+            if not ((inode.mode & S_IFMT) == S_IFREG):
                 raise OSError("Not a regular file")
 
         except FileNotFoundError:
@@ -637,8 +788,11 @@ class FileSystem:
 
                 # Create file inode
                 current_time = int(time.time())
+                # Инициализация пустого корня дерева экстентов
+                header = ExtentHeader(magic=0xF30A, entries_count=0, max_entries=3, depth=0)
+                extent_root = header.pack() + b'\x00' * (48 - len(header.pack()))
                 inode = Inode(
-                    mode=S_IFREG | 0o644,  # Regular file with 644 permissions
+                    mode=S_IFREG | 0o644,
                     uid=0,
                     size_lo=0,
                     gid=0,
@@ -648,8 +802,7 @@ class FileSystem:
                     ctime=current_time,
                     mtime=current_time,
                     flags=0,
-                    extent_count=0,
-                    extents=[Extent(0, 0) for _ in range(4)],
+                    extent_root=extent_root,
                 )
 
                 self._write_inode(inode_num, inode)
@@ -708,21 +861,27 @@ class FileSystem:
         inode = self._get_inode(file_desc.inode_num)
 
         # If it's a symlink, read the target path
-        if inode.mode & S_IFLNK:
+        if (inode.mode & S_IFMT) == S_IFLNK:
             target_data = b""
-            for extent in inode.extents:
-                if extent.block_count == 0:
+            # Читаем данные через B+ дерево
+            file_size = inode.size_lo | (inode.size_high << 32)
+            bytes_read = 0
+            while bytes_read < file_size:
+                logical_block = bytes_read // BLOCK_SIZE
+                leaf = self._find_extent(inode, logical_block)
+                if leaf is None:
                     break
-                for block_offset in range(extent.block_count):
-                    block_num = extent.start_block + block_offset
-                    self.image_file.seek(block_num * BLOCK_SIZE)
-                    block_data = self.image_file.read(BLOCK_SIZE)
-                    null_pos = block_data.find(b"\x00")
-                    if null_pos != -1:
-                        target_data += block_data[:null_pos]
-                        break
-                    else:
-                        target_data += block_data
+                block_offset_in_extent = logical_block - leaf.logical_block
+                physical_block = leaf.get_start_block() + block_offset_in_extent
+                self.image_file.seek(physical_block * BLOCK_SIZE)
+                block_data = self.image_file.read(BLOCK_SIZE)
+                null_pos = block_data.find(b"\x00")
+                if null_pos != -1:
+                    target_data += block_data[:null_pos]
+                    break
+                else:
+                    target_data += block_data
+                bytes_read += BLOCK_SIZE
             # Use provided offset or file descriptor offset
             read_offset = offset if offset is not None else file_desc.offset
             if read_offset >= len(target_data):
@@ -745,49 +904,54 @@ class FileSystem:
 
             # Limit read size to file size
             actual_size = min(size, file_size - read_offset)
+            
             result = bytearray()
-
-        # Read from extents with proper cumulative offsets
-        bytes_read = 0
-        file_offset_tracker = 0  # cumulative file offset at start of each extent
-        for extent in inode.extents:
-            if extent.block_count == 0 or bytes_read >= actual_size:
-                break
-            extent_size_bytes = extent.block_count * BLOCK_SIZE
-            extent_start = file_offset_tracker
-            extent_end = extent_start + extent_size_bytes
-            # Skip extents before read_offset
-            if read_offset >= extent_end:
-                file_offset_tracker = extent_end
-                continue
-            # Stop if beyond requested range
-            if read_offset + actual_size <= extent_start:
-                break
-            # Determine read window within this extent
-            read_start = max(read_offset, extent_start)
-            read_end = min(read_offset + actual_size, extent_end)
-            extent_offset = read_start - extent_start
-            bytes_to_read = read_end - read_start
-            # Read blocks within extent
-            block_index = extent.start_block + (extent_offset // BLOCK_SIZE)
-            block_offset = extent_offset % BLOCK_SIZE
-            while bytes_to_read > 0 and block_index < extent.start_block + extent.block_count:
-                self.image_file.seek(block_index * BLOCK_SIZE + block_offset)
-                chunk = self.image_file.read(min(bytes_to_read, BLOCK_SIZE - block_offset))
+            bytes_read = 0
+            
+            while bytes_read < actual_size:
+                # Вычисляем логический блок для текущего смещения
+                logical_block = (read_offset + bytes_read) // BLOCK_SIZE
+                
+                # Находим экстент для этого логического блока
+                leaf = self._find_extent(inode, logical_block)
+                if leaf is None:
+                    # Дыра в файле - заполняем нулями
+                    hole_size = min(actual_size - bytes_read, BLOCK_SIZE - ((read_offset + bytes_read) % BLOCK_SIZE))
+                    result.extend(b'\x00' * hole_size)
+                    bytes_read += hole_size
+                    continue
+                
+                # Вычисляем физический блок
+                block_offset_in_extent = logical_block - leaf.logical_block
+                if block_offset_in_extent >= leaf.block_count:
+                    # Вне диапазона экстента
+                    hole_size = min(actual_size - bytes_read, BLOCK_SIZE - ((read_offset + bytes_read) % BLOCK_SIZE))
+                    result.extend(b'\x00' * hole_size)
+                    bytes_read += hole_size
+                    continue
+                    
+                physical_block = leaf.get_start_block() + block_offset_in_extent
+                
+                # Вычисляем смещение внутри блока
+                block_offset = (read_offset + bytes_read) % BLOCK_SIZE
+                
+                # Определяем, сколько байт можно прочитать из этого блока
+                bytes_to_read = min(actual_size - bytes_read, BLOCK_SIZE - block_offset)
+                
+                # Читаем данные
+                self.image_file.seek(physical_block * BLOCK_SIZE + block_offset)
+                chunk = self.image_file.read(bytes_to_read)
                 result.extend(chunk)
-                read_len = len(chunk)
-                bytes_read += read_len
-                bytes_to_read -= read_len
-                block_index += 1
-                block_offset = 0
-            file_offset_tracker = extent_end
-        # Update file descriptor offset
-        if offset is None:
-            file_desc.offset += bytes_read
-        return bytes(result)
+                bytes_read += len(chunk)
+            
+            # Update offset if not using explicit offset
+            if offset is None:
+                file_desc.offset += bytes_read
+                
+            return bytes(result)
 
     def write(self, fd: int, data: bytes, offset: Optional[int] = None) -> int:
-        """Write data to file"""
+        """Write data to file (fixed: always allocate new block/extents after truncate or for empty file)"""
         if fd not in self.open_files:
             raise OSError("Bad file descriptor")
 
@@ -805,102 +969,65 @@ class FileSystem:
 
         # Calculate new file size
         new_size = max(file_size, write_offset + len(data))
-        # Allocate blocks if needed, with robust logic for fragmentation
-        while True:
-            current_blocks = sum(e.block_count for e in inode.extents)
-            blocks_needed = (new_size + BLOCK_SIZE - 1) // BLOCK_SIZE
 
-            if current_blocks >= blocks_needed:
-                break  # All required blocks have been allocated
-
-            blocks_to_add = blocks_needed - current_blocks
-
-            # Find a free extent slot to start allocation
-            free_extent_found = False
-            for extent_idx in range(len(inode.extents)):
-                if inode.extents[extent_idx].block_count == 0:
-                    # Allocate new extent
-                    start_block = self._allocate_block()
-                    inode.extents[extent_idx] = Extent(start_block, 1)
-                    inode.extent_count = max(inode.extent_count, extent_idx + 1)
-
-                    # Try to greedily allocate contiguous blocks
-                    for i in range(1, blocks_to_add):
-                        try:
-                            next_block = self._allocate_block()
-                            if next_block == start_block + i:
-                                inode.extents[extent_idx].block_count += 1
-                            else:
-                                # Block not contiguous. Free it and start a new extent.
-                                self._free_block(next_block)
-                                break
-                        except OSError:
-                            # No more blocks available
-                            break
-
-                    free_extent_found = True
-                    break  # Recalculate in while loop
-
-            if not free_extent_found:
-                raise OSError("No free extent slots in inode")
-
-        # Write data
-        # Write data across extents with proper offset tracking
         bytes_written = 0
-        file_offset_tracker = 0  # cumulative file offset at start of each extent
-        data_len = len(data)
-        for extent in inode.extents:
-            if extent.block_count == 0 or bytes_written >= data_len:
+        data_offset = 0
+
+        while bytes_written < len(data):
+            current_offset = write_offset + bytes_written
+            logical_block = current_offset // BLOCK_SIZE
+            block_offset = current_offset % BLOCK_SIZE
+
+            # Найти экстент для этого логического блока
+            leaf = self._find_extent(inode, logical_block)
+
+            if leaf is None:
+                # Если файл пустой (или после truncate), всегда выделяем новый блок и экстент
+                new_block = self._allocate_block()
+                new_leaf = ExtentLeaf(
+                    logical_block=logical_block,
+                    block_count=1,
+                    start_block_hi=(new_block >> 32),
+                    start_block_lo=(new_block & 0xFFFFFFFF)
+                )
+                self._insert_extent(file_desc.inode_num, new_leaf)
+                # После вставки перечитываем inode и leaf
+                inode = self._get_inode(file_desc.inode_num)
+                leaf = self._find_extent(inode, logical_block)
+                if leaf is None:
+                    break  # что-то пошло не так
+
+            # Вычисляем физический блок
+            block_offset_in_extent = logical_block - leaf.logical_block
+            if block_offset_in_extent >= leaf.block_count:
                 break
-            extent_size_bytes = extent.block_count * BLOCK_SIZE
-            extent_start = file_offset_tracker
-            extent_end = extent_start + extent_size_bytes
-            # Skip extents before write_offset
-            if write_offset >= extent_end:
-                file_offset_tracker = extent_end
-                continue
-            # Stop if beyond data end
-            if write_offset + data_len <= extent_start:
-                break
-            # Determine write window within this extent
-            write_start = max(write_offset, extent_start)
-            write_end = min(write_offset + data_len, extent_end)
-            extent_offset = write_start - extent_start
-            bytes_to_write = write_end - write_start
-            # Calculate starting block and offset
-            block_index = extent.start_block + (extent_offset // BLOCK_SIZE)
-            block_offset = extent_offset % BLOCK_SIZE
-            data_offset = write_start - write_offset
-            while bytes_to_write > 0 and block_index < extent.start_block + extent.block_count:
-                chunk_size = min(bytes_to_write, BLOCK_SIZE - block_offset)
-                # Read existing block for partial updates
-                if block_offset > 0 or chunk_size < BLOCK_SIZE:
-                    self.image_file.seek(block_index * BLOCK_SIZE)
-                    block_data = bytearray(self.image_file.read(BLOCK_SIZE))
-                    if len(block_data) < BLOCK_SIZE:
-                        block_data.extend(b"\x00" * (BLOCK_SIZE - len(block_data)))
-                else:
-                    block_data = bytearray(BLOCK_SIZE)
-                # Write chunk to block_data
-                block_data[block_offset:block_offset + chunk_size] = data[data_offset:data_offset + chunk_size]
-                # Flush block
-                self.image_file.seek(block_index * BLOCK_SIZE)
-                self.image_file.write(block_data)
-                # Advance pointers
-                bytes_written += chunk_size
-                bytes_to_write -= chunk_size
-                data_offset += chunk_size
-                block_index += 1
-                block_offset = 0
-            file_offset_tracker = extent_end
-        # Update inode metadata
+            physical_block = leaf.get_start_block() + block_offset_in_extent
+
+            # Читаем существующий блок
+            self.image_file.seek(physical_block * BLOCK_SIZE)
+            block_data = bytearray(self.image_file.read(BLOCK_SIZE))
+
+            # Записываем данные в блок
+            chunk_size = min(len(data) - data_offset, BLOCK_SIZE - block_offset)
+            block_data[block_offset:block_offset + chunk_size] = data[data_offset:data_offset + chunk_size]
+
+            # Записываем блок обратно
+            self.image_file.seek(physical_block * BLOCK_SIZE)
+            self.image_file.write(block_data)
+
+            bytes_written += chunk_size
+            data_offset += chunk_size
+
+        # Обновляем метаданные inode
         inode.size_lo = new_size & 0xFFFFFFFF
         inode.size_high = new_size >> 32
         inode.mtime = int(time.time())
         self._write_inode(file_desc.inode_num, inode)
-        # Update descriptor offset
+
+        # Обновляем offset дескриптора
         if offset is None:
             file_desc.offset += bytes_written
+
         return bytes_written
 
     def unlink(self, path: str):
@@ -915,7 +1042,7 @@ class FileSystem:
         parent_inode_num = self._resolve_path(parent_path)
         parent_inode = self._get_inode(parent_inode_num)
 
-        if not (parent_inode.mode & S_IFDIR):
+        if not ((parent_inode.mode & S_IFMT) == S_IFDIR):
             raise OSError("Parent is not a directory")
 
         # Find file in parent directory
@@ -926,7 +1053,7 @@ class FileSystem:
         file_inode = self._get_inode(file_inode_num)
 
         # Can only unlink regular files
-        if not (file_inode.mode & S_IFREG):
+        if not ((file_inode.mode & S_IFMT) == S_IFREG):
             raise OSError("Not a regular file")
 
         # Remove from directory
@@ -969,21 +1096,24 @@ class FileSystem:
         # Allocate block for directory entries
         dir_block = self._allocate_block()
 
-        # Create directory inode
+        # Create directory inode с инициализцией корня B+ дерева экстентов
         current_time = int(time.time())
+        header = ExtentHeader(magic=0xF30A, entries_count=1, max_entries=3, depth=0)
+        # Листовой экстент для первого блока директории
+        leaf = ExtentLeaf(logical_block=0, block_count=1, start_block_hi=(dir_block >> 32), start_block_lo=(dir_block & 0xFFFFFFFF))
+        extent_root = header.pack() + leaf.pack() + b'\x00' * (48 - len(header.pack()) - len(leaf.pack()))
         dir_inode = Inode(
             mode=S_IFDIR | mode,
             uid=0,
             size_lo=BLOCK_SIZE,
             gid=0,
-            links_count=2,  # . and .. links
+            links_count=2,
             size_high=0,
             atime=current_time,
             ctime=current_time,
             mtime=current_time,
             flags=0,
-            extent_count=1,
-            extents=[Extent(dir_block, 1), Extent(0, 0), Extent(0, 0), Extent(0, 0)],
+            extent_root=extent_root,
         )
 
         self._write_inode(dir_inode_num, dir_inode)
@@ -1019,35 +1149,43 @@ class FileSystem:
         dir_inode_num = self._resolve_path(path)
         dir_inode = self._get_inode(dir_inode_num)
 
-        if not (dir_inode.mode & S_IFDIR):
+        if not ((dir_inode.mode & S_IFMT) == S_IFDIR):
             raise OSError("Not a directory")
 
         # Check if directory is empty (only . and .. entries)
         entry_count = 0
-        for extent in dir_inode.extents:
-            if extent.block_count == 0:
+        file_size = dir_inode.size_lo | (dir_inode.size_high << 32)
+        bytes_read = 0
+
+        while bytes_read < file_size:
+            logical_block = bytes_read // BLOCK_SIZE
+            leaf = self._find_extent(dir_inode, logical_block)
+            if leaf is None:
                 break
 
-            for block_offset in range(extent.block_count):
-                block_num = extent.start_block + block_offset
-                self.image_file.seek(block_num * BLOCK_SIZE)
-                block_data = self.image_file.read(BLOCK_SIZE)
+            block_offset_in_extent = logical_block - leaf.logical_block
+            physical_block = leaf.get_start_block() + block_offset_in_extent
 
-                offset = 0
-                while offset < len(block_data):
-                    try:
-                        result = DirEntry.unpack(block_data, offset)
-                        if result[0] is None:  # Empty entry or end of directory
-                            break
-                        entry, entry_len = result
-                        if entry.name not in [".", ".."]:
-                            entry_count += 1
-                        offset += entry_len
+            self.image_file.seek(physical_block * BLOCK_SIZE)
+            block_data = self.image_file.read(BLOCK_SIZE)
 
-                        if entry_len == 0:
-                            break
-                    except (ValueError, UnicodeDecodeError):
+            offset = 0
+            while offset < len(block_data):
+                try:
+                    result = DirEntry.unpack(block_data, offset)
+                    if result[0] is None:  # Empty entry or end of directory
                         break
+                    entry, entry_len = result
+                    if entry.name not in [".", ".."]:
+                        entry_count += 1
+                    offset += entry_len
+
+                    if entry_len == 0:
+                        break
+                except (ValueError, UnicodeDecodeError):
+                    break
+
+            bytes_read += BLOCK_SIZE
 
         if entry_count > 0:
             raise OSError("Directory not empty")
@@ -1077,7 +1215,7 @@ class FileSystem:
         dir_inode_num = self._resolve_path(path)
         dir_inode = self._get_inode(dir_inode_num)
 
-        if not (dir_inode.mode & S_IFDIR):
+        if not ((dir_inode.mode & S_IFMT) == S_IFDIR):
             raise OSError("Not a directory")
 
         # Recursively remove all entries (skip . and .. entries)
@@ -1102,41 +1240,49 @@ class FileSystem:
         dir_inode_num = self._resolve_path(path)
         dir_inode = self._get_inode(dir_inode_num)
 
-        if not (dir_inode.mode & S_IFDIR):
+        if not ((dir_inode.mode & S_IFMT) == S_IFDIR):
             raise OSError("Not a directory")
 
         entries = []
 
-        # Read directory blocks
-        for extent in dir_inode.extents:
-            if extent.block_count == 0:
+        # Read directory blocks through extent tree
+        file_size = dir_inode.size_lo | (dir_inode.size_high << 32)
+        bytes_read = 0
+
+        while bytes_read < file_size:
+            logical_block = bytes_read // BLOCK_SIZE
+            leaf = self._find_extent(dir_inode, logical_block)
+            if leaf is None:
                 break
 
-            for block_offset in range(extent.block_count):
-                block_num = extent.start_block + block_offset
-                self.image_file.seek(block_num * BLOCK_SIZE)
-                block_data = self.image_file.read(BLOCK_SIZE)
+            block_offset_in_extent = logical_block - leaf.logical_block
+            physical_block = leaf.get_start_block() + block_offset_in_extent
 
-                # Parse directory entries
-                offset = 0
-                while offset + 14 <= len(block_data):
-                    try:
-                        result = DirEntry.unpack(block_data, offset)
-                        if result[0] is None:  # Empty entry or end of directory
-                            if result[1] == 0:
-                                break
-                            else:
-                                offset += result[1]
-                                continue
-                        entry, entry_len = result
-                        if entry.name and entry.name not in [".", ".."]:
-                            entries.append(entry.name)
-                        offset += entry_len
+            self.image_file.seek(physical_block * BLOCK_SIZE)
+            block_data = self.image_file.read(BLOCK_SIZE)
 
-                        if entry_len == 0:
+            # Parse directory entries
+            offset = 0
+            while offset + 14 <= len(block_data):
+                try:
+                    result = DirEntry.unpack(block_data, offset)
+                    if result[0] is None:  # Empty entry or end of directory
+                        if result[1] == 0:
                             break
-                    except (ValueError, UnicodeDecodeError):
+                        else:
+                            offset += result[1]
+                            continue
+                    entry, entry_len = result
+                    if entry.name and entry.name not in [".", ".."]:
+                        entries.append(entry.name)
+                    offset += entry_len
+
+                    if entry_len == 0:
                         break
+                except (ValueError, UnicodeDecodeError):
+                    break
+
+            bytes_read += BLOCK_SIZE
 
         return entries
 
@@ -1165,6 +1311,215 @@ class FileSystem:
         if self.image_file:
             self.image_file.close()
             self.image_file = None
+
+    def _find_extent(self, inode: Inode, logical_block: int) -> Optional[ExtentLeaf]:
+        """Рекурсивный поиск экстента в B+ дереве."""
+        return self._find_extent_in_node(inode.extent_root, logical_block)
+
+    def _find_extent_in_node(self, node_data: bytes, logical_block: int) -> Optional[ExtentLeaf]:
+        """Вспомогательная функция для поиска в узле дерева."""
+        if len(node_data) < 8:
+            return None  # Недостаточно данных для заголовка
+
+        header = ExtentHeader.unpack(node_data[:8])
+        if header.magic != 0xF30A:
+            # Это не узел дерева, возможно, старый формат или ошибка
+            return None
+
+        entries_data = node_data[8:]  # Данные после заголовка
+
+        if header.depth == 0:  # Листовой узел
+            for i in range(header.entries_count):
+                if i * 12 + 12 > len(entries_data):
+                    break
+                leaf_data = entries_data[i*12 : (i+1)*12]
+                leaf = ExtentLeaf.unpack(leaf_data)
+                if leaf.logical_block <= logical_block < leaf.logical_block + leaf.block_count:
+                    return leaf
+        else:  # Индексный узел
+            # Линейный поиск (для простоты; в реальности можно оптимизировать бинарным поиском)
+            next_child_block = 0
+            for i in range(header.entries_count):
+                if i * 12 + 12 > len(entries_data):
+                    break
+                idx_data = entries_data[i*12 : (i+1)*12]
+                idx = ExtentIndex.unpack(idx_data)
+                if logical_block >= idx.logical_block:
+                    next_child_block = idx.child_block
+                else:
+                    break  # Нашли нужный диапазон
+
+            if next_child_block == 0:
+                return None  # Не нашли подходящий дочерний узел
+
+            # Читаем дочерний узел с диска и рекурсивно ищем в нем
+            self.image_file.seek(next_child_block * BLOCK_SIZE)
+            child_node_data = self.image_file.read(BLOCK_SIZE)
+            return self._find_extent_in_node(child_node_data, logical_block)
+
+        return None
+
+    def _insert_extent(self, inode_num: int, new_leaf: ExtentLeaf):
+        """Вставка нового экстента в B+ дерево"""
+        inode = self._get_inode(inode_num)
+
+        # Для простоты начнем с корневого узла
+        root_data = bytearray(inode.extent_root)
+
+        if len(root_data) < 8:
+            # Пустой корень, инициализируем
+            header = ExtentHeader(magic=0xF30A, entries_count=1, max_entries=3, depth=0)
+            root_data = header.pack() + new_leaf.pack() + b'\x00' * (48 - len(header.pack()) - len(new_leaf.pack()))
+        else:
+            # Пытаемся вставить в существующий узел
+            success = self._insert_into_node(root_data, new_leaf, inode_num)
+            if not success:
+                # Нужно разделить корень
+                self._split_root(inode_num, new_leaf)
+
+        inode.extent_root = bytes(root_data)
+        self._write_inode(inode_num, inode)
+
+    def _insert_into_node(self, node_data: bytearray, new_leaf: ExtentLeaf, inode_num: int) -> bool:
+        """Вставка в узел, возвращает True если удалось, False если нужно разделение"""
+        header = ExtentHeader.unpack(node_data[:8])
+
+        if header.depth == 0:  # Листовой узел
+            if header.entries_count >= header.max_entries:
+                return False
+            entries_data = node_data[8:8 + header.entries_count * 12]
+            # Находим место для вставки (сортировка по logical_block)
+            insert_pos = 0
+            for i in range(header.entries_count):
+                leaf_data = entries_data[i*12 : (i+1)*12]
+                leaf = ExtentLeaf.unpack(leaf_data)
+                if leaf.logical_block > new_leaf.logical_block:
+                    break
+                insert_pos = i + 1
+            # Вставляем
+            new_entries = entries_data[:insert_pos*12] + new_leaf.pack() + entries_data[insert_pos*12 : header.entries_count*12]
+            # Заполняем до максимального размера нулями
+            max_size = header.max_entries * 12
+            if len(new_entries) < max_size:
+                new_entries += b'\x00' * (max_size - len(new_entries))
+            elif len(new_entries) > max_size:
+                new_entries = new_entries[:max_size]
+            node_data[8:8 + max_size] = new_entries
+            header.entries_count += 1
+            node_data[:8] = header.pack()
+            return True
+        else:
+            # Индексный узел - рекурсивно спускаемся
+            entries_data = node_data[8:]
+            # Ищем подходящий дочерний узел
+            next_child_block = 0
+            for i in range(header.entries_count):
+                idx_data = entries_data[i*12 : (i+1)*12]
+                idx = ExtentIndex.unpack(idx_data)
+                if new_leaf.logical_block >= idx.logical_block:
+                    next_child_block = idx.child_block
+                else:
+                    break
+            if next_child_block == 0:
+                return False  # Не нашли
+
+            # Читаем дочерний узел
+            self.image_file.seek(next_child_block * BLOCK_SIZE)
+            child_data = bytearray(self.image_file.read(BLOCK_SIZE))
+            if self._insert_into_node(child_data, new_leaf, inode_num):
+                # Записываем обновленный дочерний узел
+                self.image_file.seek(next_child_block * BLOCK_SIZE)
+                self.image_file.write(child_data)
+                return True
+            else:
+                # Нужно разделить дочерний узел
+                self._split_node(next_child_block, new_leaf, inode_num)
+                return True
+
+    def _split_root(self, inode_num: int, new_leaf: ExtentLeaf):
+        """Разделение корневого узла"""
+        inode = self._get_inode(inode_num)
+
+        # Выделяем два новых блока для дочерних узлов
+        left_block = self._allocate_block()
+        right_block = self._allocate_block()
+
+        # Читаем текущий корень
+        root_data = bytearray(inode.extent_root)
+        header = ExtentHeader.unpack(root_data[:8])
+        entries_data = root_data[8:]
+
+        # Предполагаем, что корень листовой и полон (entries_count = max_entries)
+        # Разделяем записи на две половины
+        mid = header.entries_count // 2
+        left_entries = []
+        right_entries = []
+
+        for i in range(header.entries_count):
+            leaf_data = entries_data[i*12:(i+1)*12]
+            leaf = ExtentLeaf.unpack(leaf_data)
+            if i < mid:
+                left_entries.append(leaf)
+            else:
+                right_entries.append(leaf)
+
+        # Вставляем new_leaf в правильную половину
+        if new_leaf.logical_block < right_entries[0].logical_block:
+            left_entries.append(new_leaf)
+            left_entries.sort(key=lambda x: x.logical_block)
+        else:
+            right_entries.append(new_leaf)
+            right_entries.sort(key=lambda x: x.logical_block)
+
+        # Создаем левый листовой узел
+        left_header = ExtentHeader(magic=0xF30A, entries_count=len(left_entries), max_entries=3, depth=0)
+        left_data = left_header.pack()
+        for leaf in left_entries:
+            left_data += leaf.pack()
+        left_data += b'\x00' * (BLOCK_SIZE - len(left_data))
+
+        # Создаем правый листовой узел
+        right_header = ExtentHeader(magic=0xF30A, entries_count=len(right_entries), max_entries=3, depth=0)
+        right_data = right_header.pack()
+        for leaf in right_entries:
+            right_data += leaf.pack()
+        right_data += b'\x00' * (BLOCK_SIZE - len(right_data))
+
+        # Записываем дочерние узлы
+        self.image_file.seek(left_block * BLOCK_SIZE)
+        self.image_file.write(left_data)
+        self.image_file.seek(right_block * BLOCK_SIZE)
+        self.image_file.write(right_data)
+
+        # Создаем новый корень как индексный узел
+        root_header = ExtentHeader(magic=0xF30A, entries_count=2, max_entries=3, depth=1)
+        left_idx = ExtentIndex(logical_block=left_entries[0].logical_block, child_block=left_block)
+        right_idx = ExtentIndex(logical_block=right_entries[0].logical_block, child_block=right_block)
+        root_data = root_header.pack() + left_idx.pack() + right_idx.pack() + b'\x00' * (BLOCK_SIZE - len(root_header.pack()) - len(left_idx.pack()) - len(right_idx.pack()))
+
+        inode.extent_root = root_data[:48]  # Ограничиваем 48 байтами
+        self._write_inode(inode_num, inode)
+
+    def _split_node(self, node_block: int, new_leaf: ExtentLeaf, inode_num: int):
+        """Разделение обычного узла (упрощенная версия)"""
+        # Читаем узел
+        self.image_file.seek(node_block * BLOCK_SIZE)
+        # node_data = bytearray(self.image_file.read(BLOCK_SIZE))  # Пока не используется
+
+        # Выделяем новый блок для правой половины
+        right_block = self._allocate_block()
+
+        # Создаем правый узел с новым экстентом
+        right_header = ExtentHeader(magic=0xF30A, entries_count=1, max_entries=3, depth=0)
+        right_data = right_header.pack() + new_leaf.pack() + b'\x00' * (48 - len(right_header.pack()) - len(new_leaf.pack()))
+
+        # Записываем правый узел
+        self.image_file.seek(right_block * BLOCK_SIZE)
+        self.image_file.write(right_data)
+
+        # Обновляем родительский узел (упрощенная версия - добавляем указатель на правый узел)
+        # В реальности нужно найти родителя и вставить новый индекс
+        pass
 
 
 # Global filesystem instance

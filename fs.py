@@ -3,7 +3,7 @@ import attr
 
 from crc32 import crc32
 
-INODE_SIZE = 92 
+INODE_SIZE = 88  # Новый размер инода с B+ деревом экстентов: 12 байт заголовка + 36 байт записей = 48 байт, + 40 байт базовых полей = 88
 
 @attr.s(auto_attribs=True)
 class Extent:
@@ -16,6 +16,56 @@ class Extent:
     @classmethod
     def unpack(cls, data: bytes) -> "Extent":
         return cls(*struct.unpack("<QI", data))
+ 
+@attr.s(auto_attribs=True)
+class ExtentHeader:
+    """Заголовок узла B+ дерева экстентов"""
+    magic: int         # 0xF30A
+    entries_count: int # число записей в узле
+    max_entries: int   # максимальное число записей
+    depth: int         # глубина дерева (0 - лист)
+
+    def pack(self) -> bytes:
+        return struct.pack("<HHHH", self.magic, self.entries_count, self.max_entries, self.depth)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "ExtentHeader":
+        magic, entries_count, max_entries, depth = struct.unpack("<HHHH", data[:8])
+        return cls(magic, entries_count, max_entries, depth)
+
+@attr.s(auto_attribs=True)
+class ExtentIndex:
+    """Запись в индексном узле B+ дерева экстентов"""
+    logical_block: int  # первый логический блок
+    child_block: int    # физический номер блока дочернего узла
+
+    def pack(self) -> bytes:
+        return struct.pack("<IQ", self.logical_block, self.child_block)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "ExtentIndex":
+        logical_block, child_block = struct.unpack("<IQ", data[:12])
+        return cls(logical_block, child_block)
+
+@attr.s(auto_attribs=True)
+class ExtentLeaf:
+    """Запись в листовом узле B+ дерева экстентов (12 байт)"""
+    logical_block: int  # первый логический блок в экстенте (4 байта)
+    block_count: int    # количество блоков в экстенте (2 байта)
+    start_block_hi: int # старшие 16 бит первого физического блока
+    start_block_lo: int # младшие 32 бит первого физического блока
+
+    def pack(self) -> bytes:
+        # структура: logical_block(4) + block_count(2) + start_block_hi(2) + start_block_lo(4)
+        return struct.pack("<IHHI", self.logical_block, self.block_count, self.start_block_hi, self.start_block_lo)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "ExtentLeaf":
+        logical_block, block_count, start_block_hi, start_block_lo = struct.unpack("<IHHI", data[:12])
+        return cls(logical_block, block_count, start_block_hi, start_block_lo)
+
+    def get_start_block(self) -> int:
+        return (self.start_block_hi << 32) | self.start_block_lo
 
 
 @attr.s(auto_attribs=True)
@@ -30,11 +80,11 @@ class Inode:
     ctime: int
     mtime: int
     flags: int
-    extent_count: int
-    extents: list[Extent] = attr.ib(factory=lambda: [Extent(0, 0) for _ in range(4)])
+    # Корень B+ дерева экстентов: первые 12 байт - заголовок, оставшиеся 36 - записи
+    extent_root: bytes = attr.ib(default=b'\x00' * 48)
 
     def pack(self) -> bytes:
-        # Pack all fields except extents
+        # Pack базовые поля
         base_tuple = (
             self.mode,
             self.uid,
@@ -46,21 +96,19 @@ class Inode:
             self.ctime,
             self.mtime,
             self.flags,
-            self.extent_count,
         )
-        # Flatten extents
-        ext_tuple = []
-        for ext in self.extents:
-            ext_tuple.extend([ext.start_block, ext.block_count])
-        return struct.pack("<IIIIIIIIIII QIQIQIQI", *(base_tuple + tuple(ext_tuple)))
+        data = struct.pack("<IIIIIIIIII", *base_tuple)
+        # Добавляем сырые 48 байт корня дерева экстентов
+        return data + self.extent_root
 
     @classmethod
     def unpack(cls, data: bytes) -> "Inode":
-        unpacked = struct.unpack("<IIIIIIIIIII QIQIQIQI", data)
-        base_fields = unpacked[:11]
-        extents_raw = unpacked[11:]
-        extents = [Extent(extents_raw[i], extents_raw[i + 1]) for i in range(0, 8, 2)]
-        return cls(*base_fields, extents)
+        # Распаковываем базовые поля
+        main_data = data[:40]
+        fields = struct.unpack("<IIIIIIIIII", main_data)
+        # Сырые 48 байт корня дерева экстентов
+        extent_root = data[40:88]
+        return cls(*fields, extent_root)
 
 
 @attr.s(auto_attribs=True)
